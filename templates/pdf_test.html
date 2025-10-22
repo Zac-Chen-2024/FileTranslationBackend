@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF处理测试 - 按页编辑</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 1200px;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .upload-section {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 60px 40px;
+            text-align: center;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            margin-bottom: 30px;
+        }
+
+        .upload-section:hover {
+            border-color: #764ba2;
+            background: #f8f9ff;
+        }
+
+        .upload-section.dragover {
+            background: #e8ebff;
+            border-color: #764ba2;
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+
+        .upload-section h2 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
+
+        .upload-section p {
+            color: #666;
+            margin-bottom: 20px;
+        }
+
+        #fileInput {
+            display: none;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: 600;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .processing-section {
+            display: none;
+        }
+
+        .processing-section.active {
+            display: block;
+        }
+
+        .progress-container {
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .status-text {
+            color: #666;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        .page-editor {
+            display: none;
+        }
+
+        .page-editor.active {
+            display: block;
+        }
+
+        .page-navigation {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9ff;
+            border-radius: 10px;
+        }
+
+        .page-info {
+            font-size: 18px;
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        .nav-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .nav-btn {
+            background: white;
+            border: 2px solid #667eea;
+            color: #667eea;
+            padding: 8px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .nav-btn:hover:not(:disabled) {
+            background: #667eea;
+            color: white;
+        }
+
+        .nav-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .image-container {
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 20px;
+            background: #fafafa;
+            text-align: center;
+            min-height: 400px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .image-container img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 5px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .export-btn {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+
+        .log-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .log-section h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .log-item {
+            padding: 8px 12px;
+            margin-bottom: 5px;
+            background: white;
+            border-radius: 5px;
+            font-size: 13px;
+            color: #666;
+            border-left: 3px solid #667eea;
+        }
+
+        .log-item.success {
+            border-left-color: #38ef7d;
+        }
+
+        .log-item.error {
+            border-left-color: #ff6b6b;
+            color: #ff6b6b;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📄 PDF按页处理测试</h1>
+            <p>上传PDF → 按页拆分 → 图片翻译编辑 → 合并导出</p>
+        </div>
+
+        <div class="content">
+            <!-- 上传区域 -->
+            <div class="upload-section" id="uploadSection">
+                <div class="upload-icon">📤</div>
+                <h2>上传PDF文件</h2>
+                <p>点击或拖拽PDF文件到此处</p>
+                <input type="file" id="fileInput" accept=".pdf">
+                <button class="btn" onclick="document.getElementById('fileInput').click()">
+                    选择文件
+                </button>
+            </div>
+
+            <!-- 处理进度 -->
+            <div class="processing-section" id="processingSection">
+                <div class="progress-container">
+                    <h3>处理进度</h3>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <div class="status-text" id="statusText">准备中...</div>
+                </div>
+                <div class="spinner"></div>
+            </div>
+
+            <!-- 页面编辑器 -->
+            <div class="page-editor" id="pageEditor">
+                <div class="page-navigation">
+                    <div class="page-info">
+                        <span id="currentPageNum">1</span> / <span id="totalPages">1</span>
+                    </div>
+                    <div class="nav-buttons">
+                        <button class="nav-btn" id="prevBtn" onclick="previousPage()">
+                            ← 上一页
+                        </button>
+                        <button class="nav-btn" id="nextBtn" onclick="nextPage()">
+                            下一页 →
+                        </button>
+                    </div>
+                </div>
+
+                <div class="image-container" id="imageContainer">
+                    <img id="currentPageImage" src="" alt="当前页面">
+                </div>
+
+                <div class="action-buttons">
+                    <button class="btn" onclick="translateCurrentPage()">
+                        🌐 翻译当前页
+                    </button>
+                    <button class="btn" onclick="openEditor()">
+                        ✏️ 打开编辑器
+                    </button>
+                    <button class="btn export-btn" onclick="exportPDF()">
+                        📥 导出PDF
+                    </button>
+                    <button class="btn" onclick="resetUpload()">
+                        🔄 重新上传
+                    </button>
+                </div>
+            </div>
+
+            <!-- 日志区域 -->
+            <div class="log-section" id="logSection">
+                <h3>📋 操作日志</h3>
+                <div id="logContainer"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let pdfData = null;
+        let currentPage = 1;
+        let totalPages = 0;
+        let pageImages = [];
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            setupDragDrop();
+            setupFileInput();
+            addLog('系统就绪，等待上传PDF文件');
+        });
+
+        // 拖拽上传
+        function setupDragDrop() {
+            const uploadSection = document.getElementById('uploadSection');
+
+            uploadSection.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                uploadSection.classList.add('dragover');
+            });
+
+            uploadSection.addEventListener('dragleave', () => {
+                uploadSection.classList.remove('dragover');
+            });
+
+            uploadSection.addEventListener('drop', (e) => {
+                e.preventDefault();
+                uploadSection.classList.remove('dragover');
+
+                const files = e.dataTransfer.files;
+                if (files.length > 0 && files[0].type === 'application/pdf') {
+                    handleFileUpload(files[0]);
+                } else {
+                    addLog('请上传PDF文件', 'error');
+                }
+            });
+        }
+
+        // 文件选择
+        function setupFileInput() {
+            const fileInput = document.getElementById('fileInput');
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) {
+                    handleFileUpload(e.target.files[0]);
+                }
+            });
+        }
+
+        // 处理文件上传
+        async function handleFileUpload(file) {
+            addLog(`开始上传: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+
+            // 隐藏上传区域，显示处理进度
+            document.getElementById('uploadSection').style.display = 'none';
+            document.getElementById('processingSection').classList.add('active');
+
+            const formData = new FormData();
+            formData.append('pdf_file', file);
+
+            try {
+                updateProgress(10, '正在上传PDF文件...');
+
+                const response = await fetch('/api/pdf/split-pages', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error('上传失败');
+                }
+
+                updateProgress(50, '正在按页拆分PDF...');
+
+                const data = await response.json();
+
+                if (data.success) {
+                    pdfData = data;
+                    totalPages = data.total_pages;
+                    pageImages = data.pages;
+
+                    updateProgress(100, '拆分完成！');
+                    addLog(`✓ 成功拆分为 ${totalPages} 页`, 'success');
+
+                    setTimeout(() => {
+                        showPageEditor();
+                    }, 1000);
+                } else {
+                    throw new Error(data.error || '处理失败');
+                }
+            } catch (error) {
+                addLog(`✗ 错误: ${error.message}`, 'error');
+                setTimeout(() => resetUpload(), 2000);
+            }
+        }
+
+        // 显示页面编辑器
+        function showPageEditor() {
+            document.getElementById('processingSection').classList.remove('active');
+            document.getElementById('pageEditor').classList.add('active');
+
+            currentPage = 1;
+            loadPage(currentPage);
+            updateNavigationButtons();
+        }
+
+        // 加载页面
+        function loadPage(pageNum) {
+            if (pageNum < 1 || pageNum > totalPages) return;
+
+            currentPage = pageNum;
+            document.getElementById('currentPageNum').textContent = pageNum;
+            document.getElementById('totalPages').textContent = totalPages;
+
+            const pageData = pageImages[pageNum - 1];
+            const img = document.getElementById('currentPageImage');
+            img.src = pageData.image_url;
+
+            addLog(`加载第 ${pageNum} 页`);
+            updateNavigationButtons();
+        }
+
+        // 上一页
+        function previousPage() {
+            if (currentPage > 1) {
+                // TODO: 保存当前页的修改
+                loadPage(currentPage - 1);
+            }
+        }
+
+        // 下一页
+        function nextPage() {
+            if (currentPage < totalPages) {
+                // TODO: 保存当前页的修改
+                loadPage(currentPage + 1);
+            }
+        }
+
+        // 更新导航按钮状态
+        function updateNavigationButtons() {
+            document.getElementById('prevBtn').disabled = currentPage === 1;
+            document.getElementById('nextBtn').disabled = currentPage === totalPages;
+        }
+
+        // 翻译当前页
+        async function translateCurrentPage() {
+            addLog(`开始翻译第 ${currentPage} 页...`);
+            // TODO: 调用翻译API
+            addLog(`✓ 第 ${currentPage} 页翻译完成`, 'success');
+        }
+
+        // 打开编辑器
+        function openEditor() {
+            addLog(`打开第 ${currentPage} 页的编辑器`);
+            // TODO: 打开自定义编辑器（Fabric.js）
+        }
+
+        // 导出PDF
+        async function exportPDF() {
+            addLog('开始导出PDF...');
+            // TODO: 调用合并API
+            addLog('✓ PDF导出成功', 'success');
+        }
+
+        // 重新上传
+        function resetUpload() {
+            pdfData = null;
+            currentPage = 1;
+            totalPages = 0;
+            pageImages = [];
+
+            document.getElementById('uploadSection').style.display = 'block';
+            document.getElementById('processingSection').classList.remove('active');
+            document.getElementById('pageEditor').classList.remove('active');
+            document.getElementById('fileInput').value = '';
+
+            addLog('已重置，可重新上传');
+        }
+
+        // 更新进度
+        function updateProgress(percent, text) {
+            document.getElementById('progressFill').style.width = percent + '%';
+            document.getElementById('statusText').textContent = text;
+        }
+
+        // 添加日志
+        function addLog(message, type = 'info') {
+            const logContainer = document.getElementById('logContainer');
+            const logItem = document.createElement('div');
+            logItem.className = `log-item ${type}`;
+
+            const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+            logItem.textContent = `[${time}] ${message}`;
+
+            logContainer.appendChild(logItem);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+    </script>
+</body>
+</html>

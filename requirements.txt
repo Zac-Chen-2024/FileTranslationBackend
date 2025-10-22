@@ -1,0 +1,60 @@
+# 核心框架
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-SQLAlchemy==3.0.5
+Flask-Migrate==4.0.5
+Flask-JWT-Extended==4.5.3
+Werkzeug==2.3.7
+
+# 数据库
+SQLAlchemy==2.0.21
+
+# Web爬虫和浏览器控制
+selenium==4.15.2
+requests==2.31.0
+beautifulsoup4==4.12.2
+urllib3==1.26.18
+
+# AI和翻译服务
+openai==1.3.5
+
+# 图像处理
+Pillow==10.0.1
+opencv-python==4.8.1.78
+
+# PDF处理
+PyPDF2==3.0.1
+pdfplumber==0.10.3
+reportlab==4.0.7
+pyppeteer==1.0.2
+
+# 文档处理
+python-docx==1.1.0
+python-pptx==0.6.23
+openpyxl==3.1.2
+
+# LaTeX处理（如果需要）
+# pylatex==1.4.2
+
+# 异步支持
+asyncio==3.4.3
+aiohttp==3.9.1
+
+# 工具库
+python-dotenv==1.0.0
+python-multipart==0.0.6
+gunicorn==21.2.0  # 生产环境服务器
+
+# WebSocket 实时推送
+flask-socketio==5.3.4
+python-socketio==5.9.0
+gevent==23.9.1
+gevent-websocket==0.10.1
+
+# 百度翻译API（如果使用）
+# baidu-aip==4.16.13
+
+# 其他可能需要的库
+numpy==1.24.3
+pandas==2.0.3
+lxml==4.9.3

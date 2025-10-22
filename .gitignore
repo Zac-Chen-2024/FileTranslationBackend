@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Database
+*.db
+instance/
+
+# Logs
+logs/
+*.log
+
+# Uploads and outputs
+uploads/
+downloads/
+outputs/
+original_snapshot/
+translated_snapshot/
+web_translation_output/
+image_translation_output/
+formula_output/
+poster_output/
+temp/
+tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+config/openai_api_key.txt
+
+# Process files
+*.pid
+gunicorn.pid
+
+# Claude
+.claude/
