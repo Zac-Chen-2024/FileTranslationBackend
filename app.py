@@ -1051,6 +1051,166 @@ def translate_image_reference(image_path, source_lang='zh', target_lang='en', ma
 
     raise Exception(f"翻译失败：已重试{max_retries}次")
 
+# ========== 图片生成工具函数 ==========
+
+def generate_image_from_regions(original_image_path, regions_data):
+    """
+    从原图和regions数据生成最终的带文字图片
+
+    Args:
+        original_image_path: 原始图片路径
+        regions_data: regions JSON数据（字符串或列表）
+
+    Returns:
+        PIL Image对象
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    try:
+        # 打开原图
+        img = Image.open(original_image_path)
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+
+        # 创建绘图对象
+        draw = ImageDraw.Draw(img)
+
+        # 解析regions数据
+        if isinstance(regions_data, str):
+            regions = json.loads(regions_data)
+        else:
+            regions = regions_data
+
+        if not regions:
+            log_message("没有regions数据，返回原图", "WARN")
+            return img
+
+        log_message(f"开始渲染 {len(regions)} 个文本区域", "INFO")
+
+        # 遍历每个region，先绘制遮罩，再绘制文字
+        for idx, region in enumerate(regions):
+            try:
+                # 获取位置和大小
+                x = region.get('x', 0)
+                y = region.get('y', 0)
+                width = region.get('width', 100)
+                height = region.get('height', 30)
+
+                # 绘制白色遮罩背景
+                mask_bbox = [x, y, x + width, y + height]
+                draw.rectangle(mask_bbox, fill=(255, 255, 255, 255))
+
+                # 获取文本内容
+                text = region.get('dst', region.get('src', ''))
+                if not text:
+                    continue
+
+                # 获取字体参数
+                font_size = int(region.get('fontSize', 16))
+                font_family = region.get('fontFamily', 'Arial')
+                text_color = region.get('fill', '#000000')
+
+                # 转换颜色格式
+                if text_color.startswith('#'):
+                    text_color = text_color.lstrip('#')
+                    if len(text_color) == 6:
+                        r = int(text_color[0:2], 16)
+                        g = int(text_color[2:4], 16)
+                        b = int(text_color[4:6], 16)
+                        text_color_rgb = (r, g, b)
+                    else:
+                        text_color_rgb = (0, 0, 0)
+                else:
+                    text_color_rgb = (0, 0, 0)
+
+                # 加载字体
+                try:
+                    # 尝试加载系统字体
+                    if os.name == 'nt':  # Windows
+                        font_paths = [
+                            'C:/Windows/Fonts/msyh.ttc',  # 微软雅黑
+                            'C:/Windows/Fonts/simhei.ttf',  # 黑体
+                            'C:/Windows/Fonts/simsun.ttc',  # 宋体
+                        ]
+                    else:  # Linux/Mac
+                        font_paths = [
+                            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+                            '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+                            '/System/Library/Fonts/PingFang.ttc',
+                        ]
+
+                    font = None
+                    for font_path in font_paths:
+                        if os.path.exists(font_path):
+                            font = ImageFont.truetype(font_path, font_size)
+                            break
+
+                    if not font:
+                        font = ImageFont.load_default()
+                        log_message(f"未找到系统字体，使用默认字体", "WARN")
+
+                except Exception as font_error:
+                    log_message(f"加载字体失败: {font_error}，使用默认字体", "WARN")
+                    font = ImageFont.load_default()
+
+                # 绘制文本
+                text_align = region.get('textAlign', 'center')
+
+                # 简单的文本换行处理
+                lines = []
+                words = text
+                current_line = ""
+
+                for char in words:
+                    test_line = current_line + char
+                    bbox = draw.textbbox((0, 0), test_line, font=font)
+                    text_width = bbox[2] - bbox[0]
+
+                    if text_width <= width - 10:  # 留10px边距
+                        current_line = test_line
+                    else:
+                        if current_line:
+                            lines.append(current_line)
+                        current_line = char
+
+                if current_line:
+                    lines.append(current_line)
+
+                # 绘制每一行
+                line_height = region.get('lineHeight', 1.2)
+                actual_line_height = font_size * line_height
+
+                for line_idx, line in enumerate(lines):
+                    bbox = draw.textbbox((0, 0), line, font=font)
+                    text_width = bbox[2] - bbox[0]
+
+                    # 根据对齐方式计算x坐标
+                    if text_align == 'center':
+                        text_x = x + (width - text_width) / 2
+                    elif text_align == 'right':
+                        text_x = x + width - text_width - 5
+                    else:  # left
+                        text_x = x + 5
+
+                    text_y = y + line_idx * actual_line_height + 5
+
+                    draw.text((text_x, text_y), line, fill=text_color_rgb, font=font)
+
+                log_message(f"✓ 区域 {idx} 渲染完成: {text[:20]}...", "DEBUG")
+
+            except Exception as region_error:
+                log_message(f"渲染区域 {idx} 失败: {region_error}", "ERROR")
+                continue
+
+        log_message("图片生成完成", "SUCCESS")
+        return img
+
+    except Exception as e:
+        log_message(f"生成图片失败: {str(e)}", "ERROR")
+        import traceback
+        log_message(traceback.format_exc(), "ERROR")
+        raise
+
 # ========== 数据库模型 ========== 
 
 class User(db.Model):
@@ -3801,13 +3961,79 @@ def upload_urls(client_id):
                 uploaded_materials.append(material)
         
         db.session.commit()
-        
+
         # 使材料列表缓存失效
         invalidate_materials_cache(client_id)
-        
+
+        # ✅ 网页自动翻译 - 异步处理
+        material_ids = [m.id for m in uploaded_materials]
+        log_message(f"网页添加成功，启动自动翻译任务: {len(material_ids)} 个网页", "INFO")
+
+        import threading
+
+        def auto_translate_webpages():
+            """后台自动翻译网页"""
+            with app.app_context():
+                for mat_id in material_ids:
+                    try:
+                        material = db.session.get(Material, mat_id)
+                        if not material:
+                            continue
+
+                        log_message(f"开始自动翻译网页: {material.name}", "INFO")
+
+                        # 更新状态为翻译中
+                        material.status = MaterialStatus.TRANSLATING
+                        db.session.commit()
+
+                        # WebSocket推送
+                        if WEBSOCKET_ENABLED:
+                            emit_translation_started(client_id, material.id, f"开始翻译网页 {material.name}")
+
+                        try:
+                            # 1. 生成原始网页PDF
+                            log_message(f"生成原始网页PDF: {material.name}", "INFO")
+                            original_pdf_path, original_pdf_filename = _capture_original_webpage_pdf(material.url)
+                            material.original_pdf_path = original_pdf_filename
+
+                            # 2. 生成Google翻译PDF
+                            log_message(f"生成翻译网页PDF: {material.name}", "INFO")
+                            pdf_path, pdf_filename = _capture_google_translated_pdf(material.url)
+
+                            # 更新状态为翻译完成
+                            update_material_status(
+                                material,
+                                MaterialStatus.TRANSLATED,
+                                translated_image_path=pdf_filename,
+                                translation_error=None,
+                                processing_progress=100
+                            )
+
+                            log_message(f"网页自动翻译完成: {material.name}", "SUCCESS")
+
+                        except Exception as e:
+                            update_material_status(
+                                material,
+                                MaterialStatus.FAILED,
+                                translation_error=str(e)
+                            )
+                            log_message(f"网页自动翻译失败: {material.name} - {str(e)}", "ERROR")
+                            import traceback
+                            traceback.print_exc()
+
+                    except Exception as e:
+                        log_message(f"网页翻译异常: {str(e)}", "ERROR")
+                        import traceback
+                        traceback.print_exc()
+
+        # 启动后台翻译线程
+        thread = threading.Thread(target=auto_translate_webpages)
+        thread.daemon = True
+        thread.start()
+
         return jsonify({
             'success': True,
-            'message': f'成功添加 {len(uploaded_materials)} 个网页',
+            'message': f'成功添加 {len(uploaded_materials)} 个网页，正在自动翻译...',
             'materials': [material.to_dict() for material in uploaded_materials]
         })
     except Exception as e:
@@ -4986,6 +5212,143 @@ def save_edited_image(material_id):
             'message': str(e)
         }), 500
 
+@app.route('/api/materials/<material_id>/save-regions', methods=['POST'])
+@jwt_required()
+def save_material_regions(material_id):
+    """✅ 重构：只保存材料的regions数据，不保存图片文件"""
+    try:
+        log_message(f"保存regions数据 - 材料ID: {material_id}", "INFO")
+
+        user_id = get_jwt_identity()
+        data = request.get_json()
+
+        # 查找材料并验证权限
+        material = Material.query.join(Client).filter(
+            Material.id == material_id,
+            Client.user_id == user_id
+        ).first()
+
+        if not material:
+            return jsonify({
+                'success': False,
+                'error': '材料不存在或无权访问'
+            }), 404
+
+        # 获取regions数据
+        regions = data.get('regions', [])
+
+        if not regions:
+            log_message(f"警告：保存了空的regions数据", "WARN")
+
+        # 保存regions数据到数据库
+        material.edited_regions = json.dumps(regions, ensure_ascii=False)
+        material.has_edited_version = True
+        material.selected_result = 'api'  # 标记为使用编辑版本
+        material.updated_at = datetime.utcnow()
+
+        db.session.commit()
+
+        log_message(f"✅ Regions保存成功: {len(regions)}个区域", "SUCCESS")
+
+        # 使材料列表缓存失效
+        invalidate_materials_cache(material.client_id)
+
+        # 推送WebSocket更新（如果启用）
+        if WEBSOCKET_ENABLED:
+            emit_material_updated(
+                material.client_id,
+                material_id=material.id,
+                edited_regions=regions,
+                has_edited_version=True
+            )
+
+        return jsonify({
+            'success': True,
+            'message': f'成功保存{len(regions)}个编辑区域',
+            'material': material.to_dict()
+        })
+
+    except Exception as e:
+        log_message(f"保存regions失败: {str(e)}", "ERROR")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': '保存regions失败',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/materials/<material_id>/save-final-image', methods=['POST'])
+@jwt_required()
+def save_final_image(material_id):
+    """保存前端生成的最终图片（用于导出）"""
+    try:
+        log_message(f"保存最终图片 - 材料ID: {material_id}", "INFO")
+
+        user_id = get_jwt_identity()
+
+        # 查找材料并验证权限
+        material = Material.query.join(Client).filter(
+            Material.id == material_id,
+            Client.user_id == user_id
+        ).first()
+
+        if not material:
+            return jsonify({
+                'success': False,
+                'error': '材料不存在或无权访问'
+            }), 404
+
+        # 获取上传的图片文件
+        if 'final_image' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': '没有上传图片文件'
+            }), 400
+
+        file = request.files['final_image']
+        if not file or file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': '文件名为空'
+            }), 400
+
+        # 生成文件名
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"final_{material_id}_{timestamp}.jpg"
+
+        # 保存到 uploads 目录
+        upload_folder = os.path.join(app.root_path, 'uploads')
+        os.makedirs(upload_folder, exist_ok=True)
+        filepath = os.path.join(upload_folder, filename)
+
+        file.save(filepath)
+        log_message(f"最终图片已保存: {filepath}", "SUCCESS")
+
+        # 更新数据库，保存相对路径
+        relative_path = os.path.join('uploads', filename)
+        material.final_image_path = relative_path
+        material.has_edited_version = True
+        material.updated_at = datetime.utcnow()
+
+        db.session.commit()
+
+        log_message(f"✅ 最终图片保存成功: {relative_path}", "SUCCESS")
+
+        return jsonify({
+            'success': True,
+            'message': '最终图片保存成功',
+            'final_image_path': relative_path
+        })
+
+    except Exception as e:
+        log_message(f"保存最终图片失败: {str(e)}", "ERROR")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': '保存最终图片失败',
+            'message': str(e)
+        }), 500
+
 @app.route('/api/ai-revise-text', methods=['POST'])
 @jwt_required()
 def ai_revise_text():
@@ -5005,7 +5368,8 @@ def ai_revise_text():
         log_message(f"AI文本修改 - 模式: {mode}, 文本数量: {len(texts)}", "INFO")
 
         # 检查OpenAI配置
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_keys = load_api_keys()
+        api_key = api_keys.get('OPENAI_API_KEY')
         if not api_key:
             return jsonify({
                 'success': False,
@@ -5035,20 +5399,24 @@ def ai_revise_text():
 用户的修改要求：
 {instruction}
 
-请根据用户的要求修改文本，只返回修改后的文本内容，不要添加任何解释或说明。
-保持原文的语言（如果是中文就用中文，英文就用英文）。"""
+请严格按照用户的要求修改文本，只返回修改后的文本内容，不要添加任何解释或说明。
+重要提示：
+1. 必须严格遵循用户的指令，不要进行任何额外的优化或改动
+2. 如果用户要求仅做格式修改（如添加标点、换行、空格等），必须完整保留原文的所有内容，只调整格式
+3. 如果用户要求保留原文，绝对不能删除、替换或改写任何原文内容
+4. 保持原文的语言（如果是中文就用中文，英文就用英文）"""
 
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-5-mini",
                 messages=[
-                    {"role": "system", "content": "你是一个专业的文本编辑助手，擅长根据用户要求优化和修改文本。"},
+                    {"role": "system", "content": "你是一个专业的文本编辑助手，必须严格按照用户要求修改文本，不做任何额外的优化或改动。"},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.7,
-                max_tokens=1000
+                max_completion_tokens=2000
             )
 
-            revised_text = response.choices[0].message.content.strip()
+            revised_text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+            log_message(f"AI返回内容 - 原文长度: {len(merged_text)}, 修改后长度: {len(revised_text)}, 内容: {revised_text[:100]}", "INFO")
             results.append({
                 'original': merged_text,
                 'revised': revised_text
@@ -5065,20 +5433,24 @@ def ai_revise_text():
 用户的修改要求：
 {instruction}
 
-请根据用户的要求修改文本，只返回修改后的文本内容，不要添加任何解释或说明。
-保持原文的语言（如果是中文就用中文，英文就用英文）。"""
+请严格按照用户的要求修改文本，只返回修改后的文本内容，不要添加任何解释或说明。
+重要提示：
+1. 必须严格遵循用户的指令，不要进行任何额外的优化或改动
+2. 如果用户要求仅做格式修改（如添加标点、换行、空格等），必须完整保留原文的所有内容，只调整格式
+3. 如果用户要求保留原文，绝对不能删除、替换或改写任何原文内容
+4. 保持原文的语言（如果是中文就用中文，英文就用英文）"""
 
                 response = client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-5-mini",
                     messages=[
-                        {"role": "system", "content": "你是一个专业的文本编辑助手，擅长根据用户要求优化和修改文本。"},
+                        {"role": "system", "content": "你是一个专业的文本编辑助手，必须严格按照用户要求修改文本，不做任何额外的优化或改动。"},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.7,
-                    max_tokens=500
+                    max_completion_tokens=2000
                 )
 
-                revised_text = response.choices[0].message.content.strip()
+                revised_text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+                log_message(f"AI返回内容 - 原文长度: {len(original_text)}, 修改后长度: {len(revised_text)}, 内容: {revised_text[:100]}", "INFO")
                 results.append({
                     'original': original_text,
                     'revised': revised_text
@@ -5685,22 +6057,61 @@ def export_client_materials(client_id):
                         images = []
 
                         for page in pdf_pages:
-                            # 优先使用final_image_path(带文字完整版)
-                            log_message(f"处理第 {page.pdf_page_number} 页: has_edited={page.has_edited_version}, final={page.final_image_path}, edited={page.edited_image_path}, translated={page.translated_image_path}", "DEBUG")
+                            log_message(f"处理第 {page.pdf_page_number} 页", "DEBUG")
 
-                            if page.has_edited_version and page.final_image_path:
+                            # ✅ 优先使用前端生成的 final_image_path（100%一致）
+                            if page.final_image_path:
                                 image_path = page.final_image_path
-                                log_message(f"使用final_image_path: {image_path}", "DEBUG")
-                            elif page.has_edited_version and page.edited_image_path:
-                                image_path = page.edited_image_path
-                                log_message(f"使用edited_image_path: {image_path}", "DEBUG")
-                            elif page.translated_image_path:
-                                image_path = page.translated_image_path
-                                log_message(f"使用translated_image_path: {image_path}", "DEBUG")
+                                log_message(f"✓ 使用前端生成的 final_image_path: {image_path}", "SUCCESS")
+
+                                # 处理路径
+                                if not os.path.isabs(image_path):
+                                    image_path = os.path.join(app.root_path, image_path)
+
+                                if not os.path.exists(image_path):
+                                    log_message(f"final_image_path 文件不存在: {image_path}", "ERROR")
+                                    continue
+
+                                try:
+                                    img = Image.open(image_path)
+                                    if img.mode == 'RGBA':
+                                        img = img.convert('RGB')
+                                    images.append(img)
+                                    log_message(f"✓ 第 {page.pdf_page_number} 页使用前端生成的图片", "SUCCESS")
+                                    continue
+                                except Exception as e:
+                                    log_message(f"打开 final_image 失败: {e}", "ERROR")
+
+                            # 备用方案：从 regions + 原图动态生成
+                            if page.edited_regions and page.file_path:
+                                try:
+                                    log_message(f"从 regions + 原图动态生成", "INFO")
+
+                                    # 获取原图路径
+                                    original_path = page.file_path
+                                    if not os.path.isabs(original_path):
+                                        original_path = os.path.join(app.root_path, original_path)
+
+                                    if not os.path.exists(original_path):
+                                        log_message(f"原图不存在: {original_path}", "ERROR")
+                                        continue
+
+                                    # 从 regions 生成图片
+                                    generated_img = generate_image_from_regions(original_path, page.edited_regions)
+                                    images.append(generated_img)
+                                    log_message(f"✓ 第 {page.pdf_page_number} 页动态生成成功", "SUCCESS")
+
+                                except Exception as gen_error:
+                                    log_message(f"第 {page.pdf_page_number} 页生成失败: {gen_error}", "ERROR")
+                                    continue
                             else:
-                                log_message(f"第 {page.pdf_page_number} 页没有可用的图片路径", "WARN")
+                                log_message(f"第 {page.pdf_page_number} 页没有可用数据，跳过", "WARN")
                                 continue
 
+                        # 下面继续处理图片路径（这段代码已经不会被执行，因为上面都是continue）
+                        # 保留代码结构避免语法错误
+                        if False:  # 永远不执行
+                            image_path = None
                             # 处理路径
                             if not os.path.isabs(image_path):
                                 log_message(f"路径不是绝对路径，尝试查找: {image_path}", "DEBUG")

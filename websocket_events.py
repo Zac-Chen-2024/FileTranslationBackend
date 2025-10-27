@@ -82,11 +82,19 @@ def emit_translation_started(client_id, material_id, message='翻译已开始'):
     print(f'[WebSocket] 推送翻译开始: {room_name}, 材料={material_id}')
 
 
-def emit_material_updated(client_id, material_id, status, progress=None,
-                          translated_path=None, translation_info=None,
-                          processing_step=None, processing_progress=None,
-                          file_path=None):
-    """推送材料更新事件"""
+def emit_material_updated(client_id, material_id, status=None, progress=None,
+                          translated_path=None, translation_info=None, **kwargs):
+    """推送材料更新事件
+
+    Args:
+        client_id: 客户端ID
+        material_id: 材料ID
+        status: 材料状态
+        progress: 进度
+        translated_path: 翻译后的图片路径
+        translation_info: 翻译信息
+        **kwargs: 其他任意参数（如 edited_regions, has_edited_version 等）
+    """
     if not _socketio:
         print('[WebSocket] 警告: socketio 未初始化')
         return
@@ -94,23 +102,21 @@ def emit_material_updated(client_id, material_id, status, progress=None,
     data = {
         'client_id': client_id,
         'material_id': material_id,
-        'status': status,
     }
+    if status is not None:
+        data['status'] = status
     if progress is not None:
         data['progress'] = progress
     if translated_path:
         data['translated_path'] = translated_path
     if translation_info:
         data['translation_info'] = translation_info
-    if processing_step is not None:
-        data['processing_step'] = processing_step
-    if processing_progress is not None:
-        data['processing_progress'] = processing_progress
-    if file_path is not None:
-        data['file_path'] = file_path
+
+    # 添加所有额外的关键字参数
+    data.update(kwargs)
 
     _socketio.emit('material_updated', data, room=room_name)
-    print(f'[WebSocket] 推送材料更新: {room_name}, 材料={material_id}, 状态={status}, 进度={progress}')
+    print(f'[WebSocket] 推送材料更新: {room_name}, 材料={material_id}, 状态={status}, 进度={progress}, 额外参数={list(kwargs.keys())}')
 
 
 def emit_material_error(client_id, material_id, error):
