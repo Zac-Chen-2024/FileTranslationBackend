@@ -51,8 +51,13 @@ class ProcessingStep(str, Enum):
     UPLOADED = 'uploaded'            # 已上传
     SPLITTING = 'splitting'          # 拆分中
     SPLIT_COMPLETED = 'split_completed'  # 拆分完成
-    TRANSLATING = 'translating'      # 翻译中
-    TRANSLATED = 'translated'        # 翻译完成
+    TRANSLATING = 'translating'      # 翻译中（OCR翻译）
+    TRANSLATED = 'translated'        # 翻译完成（OCR翻译完成）
+    ENTITY_RECOGNIZING = 'entity_recognizing'  # 实体识别中
+    ENTITY_PENDING_CONFIRM = 'entity_pending_confirm'  # 等待实体确认
+    ENTITY_CONFIRMED = 'entity_confirmed'  # 实体已确认
+    LLM_TRANSLATING = 'llm_translating'  # LLM翻译中
+    LLM_TRANSLATED = 'llm_translated'  # LLM翻译完成
     FAILED = 'failed'                # 失败
 
 # 百度翻译API配置会在translate_filename函数中动态加载
@@ -1315,6 +1320,12 @@ class Material(db.Model):
     pdf_page_number = db.Column(db.Integer)  # PDF页码
     pdf_total_pages = db.Column(db.Integer)  # PDF总页数
     pdf_original_file = db.Column(db.String(500))  # PDF原始文件路径
+    # 实体识别相关字段
+    entity_recognition_enabled = db.Column(db.Boolean, default=False)  # 是否启用实体识别
+    entity_recognition_result = db.Column(db.Text)  # 实体识别结果（JSON格式）
+    entity_recognition_confirmed = db.Column(db.Boolean, default=False)  # 实体识别是否已确认
+    entity_user_edits = db.Column(db.Text)  # 用户编辑后的实体信息（JSON格式，用于指导LLM翻译）
+    entity_recognition_error = db.Column(db.Text)  # 实体识别错误信息
     # 处理步骤进度: uploaded, translating, llm_optimizing, completed, failed
     processing_step = db.Column(db.String(50), default='uploaded')
     processing_progress = db.Column(db.Integer, default=0)  # 0-100的进度百分比
@@ -1340,6 +1351,22 @@ class Material(db.Model):
                 llm_translation = json.loads(self.llm_translation_result)
             except:
                 llm_translation = None
+
+        # 解析实体识别结果
+        entity_recognition = None
+        if self.entity_recognition_result:
+            try:
+                entity_recognition = json.loads(self.entity_recognition_result)
+            except:
+                entity_recognition = None
+
+        # 解析用户编辑的实体信息
+        entity_edits = None
+        if self.entity_user_edits:
+            try:
+                entity_edits = json.loads(self.entity_user_edits)
+            except:
+                entity_edits = None
 
         return {
             'id': self.id,
@@ -1371,6 +1398,12 @@ class Material(db.Model):
             'pdfPageNumber': self.pdf_page_number,
             'pdfTotalPages': self.pdf_total_pages,
             'pdfOriginalFile': self.pdf_original_file,
+            # 实体识别相关
+            'entityRecognitionEnabled': self.entity_recognition_enabled,
+            'entityRecognitionResult': entity_recognition,
+            'entityRecognitionConfirmed': self.entity_recognition_confirmed,
+            'entityUserEdits': entity_edits,
+            'entityRecognitionError': self.entity_recognition_error,
             # 处理进度
             'processingStep': self.processing_step,
             'processingProgress': self.processing_progress
@@ -4288,6 +4321,54 @@ def start_translation(client_id):
 
                         log_message(f"百度翻译完成: {material.name}, 识别到 {len(regions)} 个区域", "SUCCESS")
 
+                        # 如果启用了实体识别，自动触发实体识别
+                        if material.entity_recognition_enabled:
+                            log_message(f"检测到启用了实体识别，开始实体识别: {material.name}", "INFO")
+                            try:
+                                # 更新状态为实体识别中
+                                material.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+                                material.processing_progress = 0
+                                db.session.commit()
+
+                                # 调用实体识别服务
+                                from entity_recognition_service import EntityRecognitionService
+                                entity_service = EntityRecognitionService()
+                                entity_result = entity_service.recognize_entities(translation_data)
+
+                                if entity_result.get('success'):
+                                    # 保存实体识别结果
+                                    material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
+                                    material.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value
+                                    material.processing_progress = 100
+                                    material.entity_recognition_error = None
+
+                                    # 保存日志
+                                    entity_service.save_entity_recognition_log(
+                                        material_id=material.id,
+                                        material_name=material.name,
+                                        ocr_result=translation_data,
+                                        entity_result=entity_result
+                                    )
+
+                                    db.session.commit()
+
+                                    log_message(f"实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体，等待用户确认", "INFO")
+                                else:
+                                    # 识别失败，记录错误但不阻止流程
+                                    material.entity_recognition_error = entity_result.get('error')
+                                    material.processing_step = ProcessingStep.TRANSLATED.value
+                                    db.session.commit()
+                                    log_message(f"实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "WARN")
+
+                            except Exception as e:
+                                # 实体识别异常，记录错误但不阻止流程
+                                log_message(f"实体识别异常: {material.name} - {str(e)}", "ERROR")
+                                import traceback
+                                traceback.print_exc()
+                                material.entity_recognition_error = str(e)
+                                material.processing_step = ProcessingStep.TRANSLATED.value
+                                db.session.commit()
+
                         return {'success': True}
 
                     except Exception as e:
@@ -5412,11 +5493,16 @@ def ai_revise_text():
                     {"role": "system", "content": "你是一个专业的文本编辑助手，必须严格按照用户要求修改文本，不做任何额外的优化或改动。"},
                     {"role": "user", "content": prompt}
                 ],
-                max_completion_tokens=2000
+                max_completion_tokens=5000
             )
 
+            # 记录 token 使用情况
+            usage = response.usage
+            log_message(f"Token使用情况 - prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens}, reasoning: {getattr(usage.completion_tokens_details, 'reasoning_tokens', 0)}, total: {usage.total_tokens}", "INFO")
+            log_message(f"完成原因: {response.choices[0].finish_reason}", "INFO")
+
             revised_text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
-            log_message(f"AI返回内容 - 原文长度: {len(merged_text)}, 修改后长度: {len(revised_text)}, 内容: {revised_text[:100]}", "INFO")
+            log_message(f"AI返回内容 - 原文长度: {len(merged_text)}, 修改后长度: {len(revised_text)}, 内容预览: {revised_text[:100] if revised_text else '(空)'}", "INFO")
             results.append({
                 'original': merged_text,
                 'revised': revised_text
@@ -5446,11 +5532,16 @@ def ai_revise_text():
                         {"role": "system", "content": "你是一个专业的文本编辑助手，必须严格按照用户要求修改文本，不做任何额外的优化或改动。"},
                         {"role": "user", "content": prompt}
                     ],
-                    max_completion_tokens=2000
+                    max_completion_tokens=5000
                 )
 
+                # 记录 token 使用情况
+                usage = response.usage
+                log_message(f"Token使用情况 - prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens}, reasoning: {getattr(usage.completion_tokens_details, 'reasoning_tokens', 0)}, total: {usage.total_tokens}", "INFO")
+                log_message(f"完成原因: {response.choices[0].finish_reason}", "INFO")
+
                 revised_text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
-                log_message(f"AI返回内容 - 原文长度: {len(original_text)}, 修改后长度: {len(revised_text)}, 内容: {revised_text[:100]}", "INFO")
+                log_message(f"AI返回内容 - 原文长度: {len(original_text)}, 修改后长度: {len(revised_text)}, 内容预览: {revised_text[:100] if revised_text else '(空)'}", "INFO")
                 results.append({
                     'original': original_text,
                     'revised': revised_text
@@ -5585,6 +5676,557 @@ def ai_global_optimize():
             'message': str(e)
         }), 500
 
+# ============================================================================
+# 实体识别相关路由（预留接口）
+# ============================================================================
+
+@app.route('/api/materials/<material_id>/enable-entity-recognition', methods=['POST'])
+@jwt_required()
+def toggle_entity_recognition(material_id):
+    """
+    启用/禁用材料的实体识别功能
+
+    请求体:
+        {
+            "enabled": true/false
+        }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此材料'}), 403
+
+        data = request.get_json()
+        enabled = data.get('enabled', False)
+
+        material.entity_recognition_enabled = enabled
+        if not enabled:
+            # 如果禁用，清除相关数据
+            material.entity_recognition_result = None
+            material.entity_recognition_confirmed = False
+            material.entity_user_edits = None
+            material.entity_recognition_error = None
+
+        db.session.commit()
+
+        log_message(f"材料 {material.name} 实体识别已{'启用' if enabled else '禁用'}", "INFO")
+
+        return jsonify({
+            'success': True,
+            'enabled': enabled,
+            'message': f"实体识别已{'启用' if enabled else '禁用'}"
+        })
+
+    except Exception as e:
+        log_message(f"切换实体识别失败: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': '切换实体识别失败',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/materials/<material_id>/entity-recognition', methods=['POST'])
+@jwt_required()
+def start_entity_recognition(material_id):
+    """
+    开始实体识别（OCR完成后调用）
+
+    这是一个卡关步骤：
+    1. 调用实体识别API
+    2. 返回识别结果给前端
+    3. 等待前端用户确认/编辑实体
+    4. 用户确认后才能继续进行LLM翻译
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此材料'}), 403
+
+        # 检查是否已启用实体识别
+        if not material.entity_recognition_enabled:
+            return jsonify({
+                'success': False,
+                'error': '实体识别未启用',
+                'message': '请先启用实体识别功能'
+            }), 400
+
+        # 检查是否已完成OCR翻译
+        if not material.translation_text_info:
+            return jsonify({
+                'success': False,
+                'error': 'OCR翻译未完成',
+                'message': '请先完成OCR翻译再进行实体识别'
+            }), 400
+
+        log_message(f"开始实体识别: {material.name}", "INFO")
+
+        # 更新状态为实体识别中
+        material.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+        material.processing_progress = 0
+        db.session.commit()
+
+        # 解析OCR结果
+        ocr_result = json.loads(material.translation_text_info)
+
+        # 调用实体识别服务
+        from entity_recognition_service import EntityRecognitionService
+        entity_service = EntityRecognitionService()
+        entity_result = entity_service.recognize_entities(ocr_result)
+
+        if entity_result.get('success'):
+            # 保存实体识别结果
+            material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
+            material.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value
+            material.processing_progress = 100
+            material.entity_recognition_error = None
+
+            # 保存日志
+            entity_service.save_entity_recognition_log(
+                material_id=material.id,
+                material_name=material.name,
+                ocr_result=ocr_result,
+                entity_result=entity_result
+            )
+
+            db.session.commit()
+
+            log_message(f"实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体", "INFO")
+
+            return jsonify({
+                'success': True,
+                'result': entity_result,
+                'message': '实体识别完成，请确认识别结果'
+            })
+        else:
+            # 识别失败
+            material.entity_recognition_error = entity_result.get('error')
+
+            # 检查是否是可恢复错误
+            if entity_result.get('recoverable'):
+                # 可恢复错误，允许继续翻译流程
+                material.entity_recognition_enabled = False
+                material.processing_step = ProcessingStep.TRANSLATED.value
+                db.session.commit()
+
+                log_message(f"实体识别服务不可用，已禁用: {material.name}, 错误: {entity_result.get('error')}", "WARN")
+
+                return jsonify({
+                    'success': False,
+                    'error': '实体识别服务暂时不可用',
+                    'message': entity_result.get('error'),
+                    'recoverable': True,
+                    'canContinue': True
+                }), 503  # Service Unavailable
+            else:
+                # 不可恢复错误
+                material.processing_step = ProcessingStep.FAILED.value
+                db.session.commit()
+
+                log_message(f"实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "ERROR")
+
+                return jsonify({
+                    'success': False,
+                    'error': '实体识别失败',
+                    'message': entity_result.get('error')
+                }), 500
+
+    except Exception as e:
+        log_message(f"实体识别异常: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+
+        # 更新错误状态
+        try:
+            material.entity_recognition_error = str(e)
+            material.processing_step = ProcessingStep.FAILED.value
+            db.session.commit()
+        except:
+            pass
+
+        return jsonify({
+            'success': False,
+            'error': '实体识别异常',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/materials/<material_id>/entity-recognition-result', methods=['GET'])
+@jwt_required()
+def get_entity_recognition_result(material_id):
+    """获取材料的实体识别结果"""
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限访问此材料'}), 403
+
+        # 解析实体识别结果
+        entity_result = None
+        if material.entity_recognition_result:
+            try:
+                entity_result = json.loads(material.entity_recognition_result)
+            except:
+                entity_result = None
+
+        # 解析用户编辑的实体信息
+        entity_edits = None
+        if material.entity_user_edits:
+            try:
+                entity_edits = json.loads(material.entity_user_edits)
+            except:
+                entity_edits = None
+
+        return jsonify({
+            'success': True,
+            'enabled': material.entity_recognition_enabled,
+            'confirmed': material.entity_recognition_confirmed,
+            'result': entity_result,
+            'userEdits': entity_edits,
+            'error': material.entity_recognition_error,
+            'processingStep': material.processing_step,
+            'processingProgress': material.processing_progress
+        })
+
+    except Exception as e:
+        log_message(f"获取实体识别结果失败: {str(e)}", "ERROR")
+        return jsonify({
+            'success': False,
+            'error': '获取实体识别结果失败',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/materials/<material_id>/confirm-entities', methods=['POST'])
+@jwt_required()
+def confirm_entities(material_id):
+    """
+    用户确认/编辑实体识别结果（卡关步骤的确认）
+
+    请求体:
+        {
+            "entities": [
+                {
+                    "region_id": 0,
+                    "entities": [
+                        {
+                            "type": "PERSON",
+                            "value": "张三",
+                            "translation_instruction": "translate as 'Zhang San'"
+                        }
+                    ]
+                }
+            ],
+            "translationGuidance": {
+                "persons": ["张三 -> Zhang San"],
+                "locations": ["北京 -> Beijing"],
+                "organizations": ["北京大学 -> Peking University"],
+                "terms": ["机器学习 -> Machine Learning"]
+            }
+        }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此材料'}), 403
+
+        # 检查是否在等待确认状态
+        if material.processing_step != ProcessingStep.ENTITY_PENDING_CONFIRM.value:
+            return jsonify({
+                'success': False,
+                'error': '状态错误',
+                'message': '当前不在等待实体确认状态'
+            }), 400
+
+        data = request.get_json()
+        entities = data.get('entities', [])
+        translation_guidance = data.get('translationGuidance', {})
+
+        # 保存用户编辑的实体信息
+        user_edits = {
+            'entities': entities,
+            'translationGuidance': translation_guidance,
+            'confirmedAt': datetime.utcnow().isoformat()
+        }
+        material.entity_user_edits = json.dumps(user_edits, ensure_ascii=False)
+        material.entity_recognition_confirmed = True
+        material.processing_step = ProcessingStep.ENTITY_CONFIRMED.value
+
+        db.session.commit()
+
+        log_message(f"实体识别已确认: {material.name}", "INFO")
+
+        return jsonify({
+            'success': True,
+            'message': '实体识别已确认，可以继续进行LLM翻译',
+            'canProceedToLLM': True
+        })
+
+    except Exception as e:
+        log_message(f"确认实体失败: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': '确认实体失败',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/materials/<material_id>/entity-recognition/fast', methods=['POST'])
+@jwt_required()
+def entity_recognition_fast(material_id):
+    """
+    快速实体识别查询
+    仅识别实体，不进行深度搜索
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此材料'}), 403
+
+        # 确保有OCR结果
+        if not material.translation_text_info:
+            return jsonify({'success': False, 'error': '请先完成OCR识别'}), 400
+
+        # 解析OCR结果
+        ocr_result = json.loads(material.translation_text_info)
+
+        # 调用快速实体识别服务
+        from entity_recognition_service import EntityRecognitionService
+        entity_service = EntityRecognitionService()
+        entity_result = entity_service.recognize_entities(ocr_result, mode="fast")
+
+        if entity_result.get('success'):
+            log_message(f"快速实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体", "INFO")
+
+            return jsonify({
+                'success': True,
+                'result': entity_result,
+                'mode': 'fast',
+                'message': '快速识别完成，您可以选择AI深度查询或人工调整'
+            })
+        else:
+            log_message(f"快速实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "ERROR")
+
+            return jsonify({
+                'success': False,
+                'error': entity_result.get('error', '快速识别失败'),
+                'recoverable': entity_result.get('recoverable', False)
+            }), 500
+
+    except Exception as e:
+        log_message(f"快速实体识别异常: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': '快速实体识别异常',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/materials/<material_id>/entity-recognition/deep', methods=['POST'])
+@jwt_required()
+def entity_recognition_deep(material_id):
+    """
+    深度实体识别查询（全自动）
+    进行完整的Google搜索和官网分析，获取准确的官方英文名称
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此材料'}), 403
+
+        # 确保有OCR结果
+        if not material.translation_text_info:
+            return jsonify({'success': False, 'error': '请先完成OCR识别'}), 400
+
+        # 解析OCR结果
+        ocr_result = json.loads(material.translation_text_info)
+
+        # 调用深度实体识别服务
+        from entity_recognition_service import EntityRecognitionService
+        entity_service = EntityRecognitionService()
+        entity_result = entity_service.recognize_entities(ocr_result, mode="deep")
+
+        if entity_result.get('success'):
+            # 保存深度识别结果
+            material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
+            material.entity_recognition_confirmed = True  # 深度查询自动确认
+            material.processing_step = ProcessingStep.ENTITY_CONFIRMED.value
+            db.session.commit()
+
+            # 保存日志
+            entity_service.save_entity_recognition_log(
+                material_id=material.id,
+                material_name=material.name,
+                ocr_result=ocr_result,
+                entity_result=entity_result
+            )
+
+            log_message(f"深度实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体", "INFO")
+
+            return jsonify({
+                'success': True,
+                'result': entity_result,
+                'mode': 'deep',
+                'message': '深度识别完成，已自动确认，可直接进行LLM翻译'
+            })
+        else:
+            log_message(f"深度实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "ERROR")
+
+            return jsonify({
+                'success': False,
+                'error': entity_result.get('error', '深度识别失败'),
+                'recoverable': entity_result.get('recoverable', False)
+            }), 500
+
+    except Exception as e:
+        log_message(f"深度实体识别异常: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': '深度实体识别异常',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/materials/<material_id>/entity-recognition/manual-adjust', methods=['POST'])
+@jwt_required()
+def entity_recognition_manual_adjust(material_id):
+    """
+    人工调整模式（AI优化）
+    基于fast查询结果进行AI优化
+
+    请求体:
+        {
+            "fast_results": [...]  # fast查询的结果
+        }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        material = Material.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 验证权限
+        client = Client.query.get(material.client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此材料'}), 403
+
+        # 确保有OCR结果
+        if not material.translation_text_info:
+            return jsonify({'success': False, 'error': '请先完成OCR识别'}), 400
+
+        # 解析OCR结果
+        ocr_result = json.loads(material.translation_text_info)
+
+        # 获取fast查询结果
+        data = request.get_json()
+        fast_results = data.get('fast_results', [])
+        ocr_result['fast_results'] = fast_results  # 将fast结果添加到OCR结果中
+
+        # 调用人工调整模式服务
+        from entity_recognition_service import EntityRecognitionService
+        entity_service = EntityRecognitionService()
+        entity_result = entity_service.recognize_entities(ocr_result, mode="manual_adjust")
+
+        if entity_result.get('success'):
+            log_message(f"人工调整模式完成: {material.name}, 优化了 {entity_result.get('total_entities', 0)} 个实体", "INFO")
+
+            return jsonify({
+                'success': True,
+                'result': entity_result,
+                'mode': 'manual_adjust',
+                'message': 'AI优化完成，请确认后进行LLM翻译'
+            })
+        else:
+            log_message(f"人工调整模式失败: {material.name}, 错误: {entity_result.get('error')}", "ERROR")
+
+            return jsonify({
+                'success': False,
+                'error': entity_result.get('error', '人工调整模式失败'),
+                'recoverable': entity_result.get('recoverable', False)
+            }), 500
+
+    except Exception as e:
+        log_message(f"人工调整模式异常: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': '人工调整模式异常',
+            'message': str(e)
+        }), 500
+
+
 @app.route('/api/materials/<material_id>/llm-translate', methods=['POST'])
 @jwt_required()
 def llm_translate_material(material_id):
@@ -5629,6 +6271,18 @@ def llm_translate_material(material_id):
                 'from_cache': True
             })
 
+        # 检查实体识别状态（如果启用了实体识别，必须先确认实体）
+        if material.entity_recognition_enabled:
+            if not material.entity_recognition_confirmed:
+                log_message(f"材料 {material.name} 启用了实体识别但尚未确认，拒绝LLM翻译", "ERROR")
+                return jsonify({
+                    'success': False,
+                    'error': '请先完成实体识别确认',
+                    'message': '实体识别已启用，需要先确认实体信息后才能进行LLM翻译',
+                    'requireEntityConfirmation': True,
+                    'processingStep': material.processing_step
+                }), 400
+
         # 获取百度翻译结果
         if not material.translation_text_info:
             log_message("材料缺少百度翻译结果", "ERROR")
@@ -5650,16 +6304,27 @@ def llm_translate_material(material_id):
 
         # 使用LLM优化
         log_message(f"开始调用LLM服务优化翻译...", "INFO")
-        
+
         # ✅ WebSocket 推送：LLM 翻译开始
         if WEBSOCKET_ENABLED:
             emit_llm_started(material_id, progress=66)
-        
+
+        # 获取实体信息（如果已确认）
+        entity_guidance = None
+        if material.entity_recognition_enabled and material.entity_recognition_confirmed:
+            if material.entity_user_edits:
+                try:
+                    entity_data = json.loads(material.entity_user_edits)
+                    entity_guidance = entity_data.get('translationGuidance', {})
+                    log_message(f"使用实体识别信息指导LLM翻译: {len(entity_guidance)} 类实体", "INFO")
+                except:
+                    log_message("解析实体信息失败，忽略", "WARN")
+
         from llm_service import LLMTranslationService
         llm_service = LLMTranslationService(output_folder='outputs')
 
         log_message(f"LLM服务初始化成功，开始优化 {len(regions)} 个区域", "INFO")
-        llm_translations = llm_service.optimize_translations(regions)
+        llm_translations = llm_service.optimize_translations(regions, entity_guidance=entity_guidance)
         log_message(f"LLM优化完成，返回 {len(llm_translations)} 个翻译结果", "SUCCESS")
 
         # 保存LLM翻译日志和对比报告（与Reference项目一致）

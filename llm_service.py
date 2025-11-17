@@ -21,7 +21,7 @@ class LLMTranslationService:
                 return f.read().strip()
         return None
 
-    def optimize_translations(self, regions, batch_size=30):
+    def optimize_translations(self, regions, batch_size=30, entity_guidance=None):
         """
         优化翻译结果（支持批处理，避免超时）
         Args:
@@ -37,6 +37,13 @@ class LLMTranslationService:
                     ...
                 ]
             batch_size: 每批处理的regions数量（默认30，避免超时和token限制）
+            entity_guidance: 实体识别的翻译指导信息（可选）
+                {
+                    "persons": ["张三 -> Zhang San"],
+                    "locations": ["北京 -> Beijing"],
+                    "organizations": ["北京大学 -> Peking University"],
+                    "terms": ["机器学习 -> Machine Learning"]
+                }
         Returns:
             优化后的翻译列表
                 [
@@ -53,7 +60,7 @@ class LLMTranslationService:
 
         # 如果regions数量较少，直接处理
         if len(regions) <= batch_size:
-            return self._optimize_batch(regions)
+            return self._optimize_batch(regions, entity_guidance=entity_guidance)
 
         # 大量regions时，分批处理
         print(f"检测到 {len(regions)} 个区域，将分批处理（每批 {batch_size} 个）")
@@ -67,7 +74,7 @@ class LLMTranslationService:
             print(f"正在处理第 {batch_num}/{total_batches} 批（{len(batch)} 个区域）...")
 
             try:
-                batch_translations = self._optimize_batch(batch)
+                batch_translations = self._optimize_batch(batch, entity_guidance=entity_guidance)
                 all_translations.extend(batch_translations)
                 print(f"第 {batch_num} 批完成，已优化 {len(batch_translations)} 个区域")
             except Exception as e:
@@ -77,9 +84,12 @@ class LLMTranslationService:
 
         return all_translations
 
-    def _optimize_batch(self, regions):
+    def _optimize_batch(self, regions, entity_guidance=None):
         """
         优化单批翻译结果
+        Args:
+            regions: 区域列表
+            entity_guidance: 实体翻译指导（可选）
         """
         # 准备批量翻译文本
         source_texts = []
@@ -95,7 +105,7 @@ class LLMTranslationService:
             return []
 
         # 构建GPT提示
-        prompt = self._build_optimization_prompt(source_texts, len(source_texts))
+        prompt = self._build_optimization_prompt(source_texts, len(source_texts), entity_guidance=entity_guidance)
 
         try:
             # 调用GPT API（增加max_tokens以支持更多翻译）
@@ -116,16 +126,52 @@ class LLMTranslationService:
         except Exception as e:
             raise Exception(f"LLM翻译调用失败: {str(e)}")
 
-    def _build_optimization_prompt(self, source_texts, count):
-        """构建优化提示词"""
-        prompt = f"""You are a Chinese-English translator. For each input text:
-
-TRANSLATION RULES:
+    def _build_optimization_prompt(self, source_texts, count, entity_guidance=None):
+        """
+        构建优化提示词
+        Args:
+            source_texts: 源文本列表
+            count: 文本数量
+            entity_guidance: 实体翻译指导（可选）
+        """
+        # 基础规则
+        base_rules = """TRANSLATION RULES:
 - Chinese characters (中文) → Translate to English
 - English text → Keep unchanged
 - Mixed Chinese-English → Translate only Chinese parts
 - Names/Proper nouns → Translate appropriately
-- Maintain professional and accurate translation
+- Maintain professional and accurate translation"""
+
+        # 如果有实体识别指导，添加到提示词中
+        entity_guidance_text = ""
+        if entity_guidance:
+            entity_guidance_text = "\n\nSPECIAL TRANSLATION GUIDANCE (from Entity Recognition):\n"
+
+            if entity_guidance.get('persons'):
+                entity_guidance_text += "\nPerson Names:\n"
+                for item in entity_guidance.get('persons', []):
+                    entity_guidance_text += f"  - {item}\n"
+
+            if entity_guidance.get('locations'):
+                entity_guidance_text += "\nLocation Names:\n"
+                for item in entity_guidance.get('locations', []):
+                    entity_guidance_text += f"  - {item}\n"
+
+            if entity_guidance.get('organizations'):
+                entity_guidance_text += "\nOrganization Names:\n"
+                for item in entity_guidance.get('organizations', []):
+                    entity_guidance_text += f"  - {item}\n"
+
+            if entity_guidance.get('terms'):
+                entity_guidance_text += "\nSpecial Terms:\n"
+                for item in entity_guidance.get('terms', []):
+                    entity_guidance_text += f"  - {item}\n"
+
+            entity_guidance_text += "\nIMPORTANT: When you encounter any of the above entities in the text, use the exact translation provided.\n"
+
+        prompt = f"""You are a Chinese-English translator. For each input text:
+
+{base_rules}{entity_guidance_text}
 
 MANDATORY OUTPUT FORMAT:
 1. You MUST output exactly {count} lines
