@@ -956,7 +956,23 @@ def get_access_token_reference():
 def translate_image_reference(image_path, source_lang='zh', target_lang='en', max_retries=3):
     """调用百度图片翻译API - Reference项目方式（带重试机制）"""
     log_message(f"调用translate_image_reference函数", "INFO")
-    log_message(f"图片路径: {image_path}", "DEBUG")
+    log_message(f"图片路径(原始): {image_path}", "DEBUG")
+
+    # 确保使用绝对路径
+    if not os.path.isabs(image_path):
+        # 如果是相对路径，转换为绝对路径
+        abs_path = os.path.join(app.root_path, image_path)
+        if os.path.exists(abs_path):
+            image_path = abs_path
+            log_message(f"转换为绝对路径: {image_path}", "DEBUG")
+        else:
+            log_message(f"警告：文件不存在于绝对路径: {abs_path}", "WARNING")
+            # 尝试直接使用相对路径
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"找不到图片文件: {image_path} (也尝试了 {abs_path})")
+
+    log_message(f"最终图片路径: {image_path}", "DEBUG")
+    log_message(f"文件是否存在: {os.path.exists(image_path)}", "DEBUG")
     log_message(f"源语言: {source_lang}, 目标语言: {target_lang}", "DEBUG")
 
     # 禁用SSL警告
