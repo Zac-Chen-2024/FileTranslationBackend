@@ -749,7 +749,8 @@ def update_material_status(material, status, **kwargs):
             ws_data = {
                 'material_id': material.id,
                 'status': material.status,
-                'progress': material.processing_progress
+                'progress': material.processing_progress,
+                'material': material.to_dict()  # 🔧 添加完整的material对象
             }
 
             # 添加可选字段
@@ -757,6 +758,10 @@ def update_material_status(material, status, **kwargs):
                 ws_data['translated_path'] = kwargs['translated_image_path']
             if 'translation_text_info' in kwargs:
                 ws_data['translation_info'] = kwargs['translation_text_info'] if isinstance(kwargs['translation_text_info'], dict) else json.loads(kwargs['translation_text_info'])
+
+            # 🔧 添加 processing_step（如果在kwargs中传递）
+            if 'processing_step' in kwargs:
+                ws_data['processing_step'] = kwargs['processing_step']
 
             # 发送WebSocket事件
             if material.status == MaterialStatus.TRANSLATED.value:
@@ -4387,43 +4392,149 @@ def start_translation(client_id):
 
                         # 如果启用了实体识别，自动触发实体识别
                         if material.entity_recognition_enabled:
-                            log_message(f"检测到启用了实体识别，开始实体识别: {material.name}", "INFO")
-                            try:
-                                # 更新状态为实体识别中
-                                material.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
-                                material.processing_progress = 0
-                                db.session.commit()
+                            # 检查是否为PDF Session
+                            if material.pdf_session_id:
+                                log_message(f"检测到PDF Session: {material.pdf_session_id}，检查是否所有页面已完成OCR", "INFO")
 
-                                # 调用实体识别服务
-                                from entity_recognition_service import EntityRecognitionService
-                                entity_service = EntityRecognitionService()
-                                entity_result = entity_service.recognize_entities(translation_data)
+                                # 获取该PDF Session的所有页面
+                                all_pages = Material.query.filter_by(pdf_session_id=material.pdf_session_id).all()
 
-                                if entity_result.get('success'):
-                                    # 保存实体识别结果
-                                    material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
-                                    material.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value
-                                    material.processing_progress = 100
-                                    material.entity_recognition_error = None
+                                # 检查是否所有页面都完成了OCR
+                                all_completed = all(p.translation_text_info for p in all_pages)
 
-                                    # 保存日志
-                                    entity_service.save_entity_recognition_log(
-                                        material_id=material.id,
-                                        material_name=material.name,
-                                        ocr_result=translation_data,
-                                        entity_result=entity_result
-                                    )
+                                if all_completed:
+                                    # 检查是否已经触发过PDF整体识别
+                                    already_triggered = any(p.entity_recognition_triggered for p in all_pages)
 
+                                    if not already_triggered:
+                                        log_message(f"PDF Session所有页面OCR完成，触发整体实体识别: {material.pdf_session_id}", "INFO")
+
+                                        # 异步触发PDF Session实体识别
+                                        try:
+                                            from entity_recognition_service import EntityRecognitionService
+
+                                            # 合并所有页面的OCR结果
+                                            merged_ocr_result = {'regions': []}
+                                            for page in all_pages:
+                                                if page.translation_text_info:
+                                                    page_ocr = json.loads(page.translation_text_info)
+                                                    merged_ocr_result['regions'].extend(page_ocr.get('regions', []))
+
+                                            # 设置所有页面状态为识别中
+                                            for page in all_pages:
+                                                page.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+                                                page.entity_recognition_triggered = True
+                                            db.session.commit()
+
+                                            # 调用实体识别服务
+                                            entity_service = EntityRecognitionService()
+                                            entity_result = entity_service.recognize_entities(merged_ocr_result, mode="fast")
+
+                                            if entity_result.get('success'):
+                                                # 保存结果到所有页面
+                                                result_json = json.dumps(entity_result, ensure_ascii=False)
+                                                for page in all_pages:
+                                                    page.entity_recognition_result = result_json
+                                                    page.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value
+                                                    page.processing_progress = 100
+                                                    page.entity_recognition_error = None
+
+                                                db.session.commit()
+
+                                                # WebSocket推送更新（只推送第一页）
+                                                first_page = all_pages[0]
+                                                if WEBSOCKET_ENABLED:
+                                                    emit_material_updated(
+                                                        first_page.client_id,
+                                                        first_page.id,
+                                                        processing_step=ProcessingStep.ENTITY_PENDING_CONFIRM.value,
+                                                        material=first_page.to_dict()
+                                                    )
+
+                                                log_message(f"PDF Session整体实体识别完成: {material.pdf_session_id}, 识别到 {entity_result.get('total_entities', 0)} 个实体", "SUCCESS")
+                                            else:
+                                                # 识别失败，恢复所有页面状态
+                                                for page in all_pages:
+                                                    page.entity_recognition_error = entity_result.get('error')
+                                                    page.processing_step = ProcessingStep.TRANSLATED.value
+                                                db.session.commit()
+                                                log_message(f"PDF Session整体实体识别失败: {material.pdf_session_id}, 错误: {entity_result.get('error')}", "WARN")
+
+                                        except Exception as e:
+                                            log_message(f"PDF Session整体实体识别异常: {material.pdf_session_id} - {str(e)}", "ERROR")
+                                            import traceback
+                                            traceback.print_exc()
+
+                                            # 恢复所有页面状态
+                                            for page in all_pages:
+                                                page.entity_recognition_error = str(e)
+                                                page.processing_step = ProcessingStep.TRANSLATED.value
+                                            db.session.commit()
+                                    else:
+                                        log_message(f"PDF Session已触发过实体识别，跳过: {material.pdf_session_id}", "INFO")
+                                else:
+                                    not_completed = [p.pdf_page_number for p in all_pages if not p.translation_text_info]
+                                    log_message(f"PDF Session部分页面尚未完成OCR，等待其他页面: {not_completed}", "INFO")
+
+                            else:
+                                # 单个图片材料，使用原有逻辑
+                                log_message(f"检测到启用了实体识别，开始实体识别: {material.name}", "INFO")
+                                try:
+                                    # 更新状态为实体识别中
+                                    material.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+                                    material.processing_progress = 0
                                     db.session.commit()
 
-                                    log_message(f"实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体，等待用户确认", "INFO")
-                                else:
-                                    # 识别失败，记录错误但不阻止流程
-                                    material.entity_recognition_error = entity_result.get('error')
+                                    # 调用实体识别服务
+                                    from entity_recognition_service import EntityRecognitionService
+                                    entity_service = EntityRecognitionService()
+                                    entity_result = entity_service.recognize_entities(translation_data)
+
+                                    if entity_result.get('success'):
+                                        # 保存实体识别结果
+                                        material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
+                                        material.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value
+                                        material.processing_progress = 100
+                                        material.entity_recognition_error = None
+
+                                        # 保存日志
+                                        entity_service.save_entity_recognition_log(
+                                            material_id=material.id,
+                                            material_name=material.name,
+                                            ocr_result=translation_data,
+                                            entity_result=entity_result
+                                        )
+
+                                        db.session.commit()
+
+                                        log_message(f"实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体，等待用户确认", "INFO")
+                                    else:
+                                        # 识别失败，记录错误但不阻止流程
+                                        material.entity_recognition_error = entity_result.get('error')
+                                        material.processing_step = ProcessingStep.TRANSLATED.value
+                                        material.entity_recognition_triggered = True  # 标记已尝试过
+                                        db.session.commit()
+                                        log_message(f"实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "WARN")
+
+                                        # 🔧 推送WebSocket更新，告知前端实体识别失败
+                                        if WEBSOCKET_ENABLED:
+                                            emit_material_updated(
+                                                material.client_id,
+                                                material.id,
+                                                processing_step=material.processing_step,
+                                                material=material.to_dict(),
+                                                entity_recognition_error=entity_result.get('error')
+                                            )
+
+                                except Exception as e:
+                                    # 实体识别异常，记录错误但不阻止流程
+                                    log_message(f"实体识别异常: {material.name} - {str(e)}", "ERROR")
+                                    import traceback
+                                    traceback.print_exc()
+                                    material.entity_recognition_error = str(e)
                                     material.processing_step = ProcessingStep.TRANSLATED.value
                                     material.entity_recognition_triggered = True  # 标记已尝试过
                                     db.session.commit()
-                                    log_message(f"实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "WARN")
 
                                     # 🔧 推送WebSocket更新，告知前端实体识别失败
                                     if WEBSOCKET_ENABLED:
@@ -4432,28 +4543,8 @@ def start_translation(client_id):
                                             material.id,
                                             processing_step=material.processing_step,
                                             material=material.to_dict(),
-                                            entity_recognition_error=entity_result.get('error')
+                                            entity_recognition_error=str(e)
                                         )
-
-                            except Exception as e:
-                                # 实体识别异常，记录错误但不阻止流程
-                                log_message(f"实体识别异常: {material.name} - {str(e)}", "ERROR")
-                                import traceback
-                                traceback.print_exc()
-                                material.entity_recognition_error = str(e)
-                                material.processing_step = ProcessingStep.TRANSLATED.value
-                                material.entity_recognition_triggered = True  # 标记已尝试过
-                                db.session.commit()
-
-                                # 🔧 推送WebSocket更新，告知前端实体识别失败
-                                if WEBSOCKET_ENABLED:
-                                    emit_material_updated(
-                                        material.client_id,
-                                        material.id,
-                                        processing_step=material.processing_step,
-                                        material=material.to_dict(),
-                                        entity_recognition_error=str(e)
-                                    )
 
                         return {'success': True}
 
@@ -6506,6 +6597,135 @@ def entity_recognition_deep(material_id):
         return jsonify({
             'success': False,
             'error': '深度实体识别异常',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/pdf-sessions/<session_id>/entity-recognition/fast', methods=['POST'])
+@jwt_required()
+def pdf_session_entity_recognition_fast(session_id):
+    """
+    PDF Session 整体实体识别
+    使用整个PDF所有页面的OCR结果一起进行实体识别
+    """
+    try:
+        print(f"\n{'='*80}")
+        print(f"[PDF Entity] PDF Session 整体实体识别开始")
+        print(f"[PDF Entity] Session ID: {session_id}")
+        print(f"{'='*80}\n")
+
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        # 获取该PDF Session的所有页面
+        pages = Material.query.filter_by(pdf_session_id=session_id).order_by(Material.pdf_page_number).all()
+
+        if not pages:
+            return jsonify({'success': False, 'error': 'PDF Session不存在'}), 404
+
+        # 验证权限（检查第一页）
+        client = Client.query.get(pages[0].client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此PDF'}), 403
+
+        print(f"[PDF Entity] 找到 {len(pages)} 个页面")
+
+        # 检查所有页面是否都完成了OCR
+        all_ocr_completed = all(p.translation_text_info for p in pages)
+        if not all_ocr_completed:
+            not_completed = [p.pdf_page_number for p in pages if not p.translation_text_info]
+            print(f"[PDF Entity] 部分页面未完成OCR: {not_completed}")
+            return jsonify({
+                'success': False,
+                'error': f'部分页面未完成OCR: {not_completed}',
+                'not_completed_pages': not_completed
+            }), 400
+
+        # 合并所有页面的OCR结果
+        print(f"[PDF Entity] 合并所有页面的OCR结果...")
+        merged_ocr_result = {'regions': []}
+
+        for page in pages:
+            ocr_result = json.loads(page.translation_text_info)
+            regions = ocr_result.get('regions', [])
+            merged_ocr_result['regions'].extend(regions)
+
+        total_regions = len(merged_ocr_result['regions'])
+        print(f"[PDF Entity] 合并后共 {total_regions} 个文本区域")
+
+        # 设置所有页面状态为识别中
+        for page in pages:
+            page.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+            page.entity_recognition_triggered = True
+        db.session.commit()
+
+        # WebSocket推送状态更新（第一页）
+        if WEBSOCKET_ENABLED:
+            emit_material_updated(
+                pages[0].client_id,
+                pages[0].id,
+                processing_step=ProcessingStep.ENTITY_RECOGNIZING.value,
+                material=pages[0].to_dict()
+            )
+
+        # 调用快速实体识别服务
+        from entity_recognition_service import EntityRecognitionService
+        entity_service = EntityRecognitionService()
+        entity_result = entity_service.recognize_entities(merged_ocr_result, mode="fast")
+
+        if entity_result.get('success'):
+            print(f"[PDF Entity] 识别成功，识别到 {entity_result.get('total_entities', 0)} 个实体")
+
+            # 保存结果到所有页面
+            result_json = json.dumps(entity_result, ensure_ascii=False)
+            for page in pages:
+                page.entity_recognition_result = result_json
+                page.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value
+
+            db.session.commit()
+
+            # WebSocket推送更新（只推送第一页，前端会显示Modal）
+            if WEBSOCKET_ENABLED:
+                emit_material_updated(
+                    pages[0].client_id,
+                    pages[0].id,
+                    processing_step=ProcessingStep.ENTITY_PENDING_CONFIRM.value,
+                    material=pages[0].to_dict()
+                )
+
+            log_message(f"PDF Session整体实体识别完成: {session_id}, 共{len(pages)}页, 识别到 {entity_result.get('total_entities', 0)} 个实体", "INFO")
+
+            return jsonify({
+                'success': True,
+                'result': entity_result,
+                'session_id': session_id,
+                'total_pages': len(pages),
+                'total_regions': total_regions,
+                'message': f'PDF整体识别完成（{len(pages)}页），识别到{entity_result.get("total_entities", 0)}个实体'
+            })
+        else:
+            log_message(f"PDF Session整体实体识别失败: {session_id}, 错误: {entity_result.get('error')}", "ERROR")
+
+            # 恢复所有页面状态
+            for page in pages:
+                page.processing_step = ProcessingStep.TRANSLATED.value
+            db.session.commit()
+
+            return jsonify({
+                'success': False,
+                'error': entity_result.get('error', 'PDF整体识别失败'),
+                'recoverable': entity_result.get('recoverable', False)
+            }), 500
+
+    except Exception as e:
+        log_message(f"PDF Session整体实体识别异常: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'PDF整体识别异常',
             'message': str(e)
         }), 500
 
