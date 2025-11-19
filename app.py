@@ -6730,6 +6730,254 @@ def pdf_session_entity_recognition_fast(session_id):
         }), 500
 
 
+@app.route('/api/pdf-sessions/<session_id>/entity-recognition/deep', methods=['POST'])
+@jwt_required()
+def pdf_session_entity_recognition_deep(session_id):
+    """
+    PDF Session 整体深度实体识别（AI优化）
+    对整个PDF的实体进行深度查询，查找官方英文名称
+    """
+    try:
+        print(f"\n{'='*80}")
+        print(f"[PDF Entity Deep] PDF Session 整体深度识别开始")
+        print(f"[PDF Entity Deep] Session ID: {session_id}")
+        print(f"{'='*80}\n")
+
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        # 获取该PDF Session的所有页面
+        pages = Material.query.filter_by(pdf_session_id=session_id).order_by(Material.pdf_page_number).all()
+
+        if not pages:
+            return jsonify({'success': False, 'error': 'PDF Session不存在'}), 404
+
+        # 验证权限（检查第一页）
+        client = Client.query.get(pages[0].client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此PDF'}), 403
+
+        print(f"[PDF Entity Deep] 找到 {len(pages)} 个页面")
+
+        # 获取请求中的实体列表
+        data = request.get_json()
+        entities = data.get('entities', [])
+
+        if not entities:
+            return jsonify({'success': False, 'error': '未提供实体列表'}), 400
+
+        print(f"[PDF Entity Deep] 收到 {len(entities)} 个实体待优化")
+
+        # 调用深度实体识别服务
+        from entity_recognition_service import EntityRecognitionService
+        entity_service = EntityRecognitionService()
+
+        # 提取中文实体名称列表
+        entity_names = []
+        for entity in entities:
+            chinese_name = entity.get('chinese_name') or entity.get('entity')
+            if chinese_name:
+                entity_names.append(chinese_name)
+
+        # 使用深度模式进行识别
+        entity_result = entity_service.deep_query_entities(entity_names)
+
+        if entity_result.get('success'):
+            print(f"[PDF Entity Deep] 深度识别成功，优化了 {len(entity_result.get('entities', []))} 个实体")
+
+            # 保存结果到所有页面
+            result_json = json.dumps(entity_result, ensure_ascii=False)
+            for page in pages:
+                page.entity_recognition_result = result_json
+
+            db.session.commit()
+
+            # WebSocket推送更新（只推送第一页）
+            if WEBSOCKET_ENABLED:
+                emit_material_updated(
+                    pages[0].client_id,
+                    pages[0].id,
+                    processing_step=ProcessingStep.ENTITY_PENDING_CONFIRM.value,
+                    material=pages[0].to_dict()
+                )
+
+            log_message(f"PDF Session整体深度识别完成: {session_id}, 共{len(pages)}页, 优化了 {len(entity_result.get('entities', []))} 个实体", "INFO")
+
+            return jsonify({
+                'success': True,
+                'result': entity_result,
+                'session_id': session_id,
+                'total_pages': len(pages),
+                'message': f'PDF整体深度识别完成（{len(pages)}页）'
+            })
+        else:
+            log_message(f"PDF Session整体深度识别失败: {session_id}, 错误: {entity_result.get('error')}", "ERROR")
+            return jsonify({
+                'success': False,
+                'error': entity_result.get('error', 'PDF整体深度识别失败'),
+                'recoverable': entity_result.get('recoverable', False)
+            }), 500
+
+    except Exception as e:
+        log_message(f"PDF Session整体深度识别异常: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'PDF整体深度识别异常',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/pdf-sessions/<session_id>/confirm-entities', methods=['POST'])
+@jwt_required()
+def pdf_session_confirm_entities(session_id):
+    """
+    PDF Session 确认实体识别结果
+    为整个PDF Session的所有页面应用相同的实体翻译指导，并触发所有页面的LLM翻译
+    """
+    try:
+        print(f"\n{'='*80}")
+        print(f"[PDF Entity Confirm] PDF Session 确认实体开始")
+        print(f"[PDF Entity Confirm] Session ID: {session_id}")
+        print(f"{'='*80}\n")
+
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+        # 获取该PDF Session的所有页面
+        pages = Material.query.filter_by(pdf_session_id=session_id).order_by(Material.pdf_page_number).all()
+
+        if not pages:
+            return jsonify({'success': False, 'error': 'PDF Session不存在'}), 404
+
+        # 验证权限（检查第一页）
+        client = Client.query.get(pages[0].client_id)
+        if not client or client.user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权限操作此PDF'}), 403
+
+        print(f"[PDF Entity Confirm] 找到 {len(pages)} 个页面")
+
+        # 获取请求数据
+        data = request.get_json()
+        entities = data.get('entities', [])
+        translation_guidance = data.get('translationGuidance', {})
+
+        # 保存用户编辑的实体信息
+        user_edits = {
+            'entities': entities,
+            'translationGuidance': translation_guidance,
+            'confirmedAt': datetime.utcnow().isoformat()
+        }
+        user_edits_json = json.dumps(user_edits, ensure_ascii=False)
+
+        # 为所有页面应用相同的实体数据
+        for page in pages:
+            page.entity_user_edits = user_edits_json
+            page.entity_recognition_confirmed = True
+            page.processing_step = ProcessingStep.ENTITY_CONFIRMED.value
+
+        db.session.commit()
+
+        log_message(f"PDF Session实体确认完成: {session_id}, 共{len(pages)}页", "INFO")
+
+        # ⭐ 自动触发所有页面的LLM翻译
+        try:
+            from threading import Thread
+            log_message(f"自动触发PDF Session所有页面的LLM翻译: {session_id}", "INFO")
+
+            def trigger_all_llm_translations():
+                with app.app_context():
+                    try:
+                        session_pages = Material.query.filter_by(pdf_session_id=session_id).order_by(Material.pdf_page_number).all()
+
+                        for page in session_pages:
+                            try:
+                                print(f"[PDF LLM] 开始翻译页面 {page.pdf_page_number}/{len(session_pages)}")
+
+                                # 更新状态为LLM翻译中
+                                page.processing_step = ProcessingStep.LLM_TRANSLATING.value
+                                db.session.commit()
+
+                                # WebSocket推送
+                                if WEBSOCKET_ENABLED:
+                                    emit_llm_started(page.id, progress=70)
+
+                                # 执行LLM翻译
+                                baidu_result = json.loads(page.translation_text_info)
+                                regions = baidu_result.get('regions', [])
+
+                                # 读取实体识别指导
+                                entity_guidance = None
+                                if page.entity_user_edits:
+                                    entity_data = json.loads(page.entity_user_edits)
+                                    entity_guidance = entity_data.get('translationGuidance', {})
+
+                                from llm_service import LLMTranslationService
+                                llm_service = LLMTranslationService(output_folder='outputs')
+                                llm_translations = llm_service.optimize_translations(regions, entity_guidance=entity_guidance)
+
+                                # 保存结果
+                                page.llm_translation_result = json.dumps(llm_translations, ensure_ascii=False)
+                                page.processing_step = ProcessingStep.LLM_TRANSLATED.value
+                                page.processing_progress = 100
+                                page.status = MaterialStatus.TRANSLATED.value
+                                db.session.commit()
+
+                                # WebSocket推送完成
+                                if WEBSOCKET_ENABLED:
+                                    emit_llm_completed(page.id, llm_translations, progress=100)
+
+                                print(f"[PDF LLM] 页面 {page.pdf_page_number} 翻译完成")
+
+                            except Exception as page_error:
+                                log_message(f"页面 {page.pdf_page_number} LLM翻译失败: {str(page_error)}", "ERROR")
+                                import traceback
+                                traceback.print_exc()
+
+                                # 标记失败
+                                page.status = MaterialStatus.FAILED.value
+                                page.processing_step = ProcessingStep.FAILED.value
+                                page.translation_error = f"LLM翻译失败: {str(page_error)}"
+                                db.session.commit()
+
+                        log_message(f"PDF Session所有页面LLM翻译完成: {session_id}", "SUCCESS")
+
+                    except Exception as e:
+                        log_message(f"PDF Session LLM翻译异常: {str(e)}", "ERROR")
+                        import traceback
+                        traceback.print_exc()
+
+            thread = Thread(target=trigger_all_llm_translations)
+            thread.daemon = True
+            thread.start()
+
+        except Exception as e:
+            log_message(f"启动PDF Session LLM翻译线程失败: {str(e)}", "WARNING")
+
+        return jsonify({
+            'success': True,
+            'message': f'PDF Session实体确认成功（{len(pages)}页），LLM翻译已自动启动',
+            'session_id': session_id,
+            'total_pages': len(pages),
+            'autoStartedLLM': True
+        })
+
+    except Exception as e:
+        log_message(f"PDF Session确认实体失败: {str(e)}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'PDF Session确认实体失败',
+            'message': str(e)
+        }), 500
+
+
 @app.route('/api/materials/<material_id>/entity-recognition/manual-adjust', methods=['POST'])
 @jwt_required()
 def entity_recognition_manual_adjust(material_id):
