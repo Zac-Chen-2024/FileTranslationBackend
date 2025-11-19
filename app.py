@@ -1338,8 +1338,10 @@ class Material(db.Model):
     pdf_original_file = db.Column(db.String(500))  # PDF原始文件路径
     # 实体识别相关字段
     entity_recognition_enabled = db.Column(db.Boolean, default=False)  # 是否启用实体识别
+    entity_recognition_mode = db.Column(db.String(20))  # 实体识别模式：'standard' 或 'deep'
     entity_recognition_result = db.Column(db.Text)  # 实体识别结果（JSON格式）
     entity_recognition_confirmed = db.Column(db.Boolean, default=False)  # 实体识别是否已确认
+    entity_recognition_triggered = db.Column(db.Boolean, default=False)  # 是否已触发实体识别（防重复）
     entity_user_edits = db.Column(db.Text)  # 用户编辑后的实体信息（JSON格式，用于指导LLM翻译）
     entity_recognition_error = db.Column(db.Text)  # 实体识别错误信息
     # 处理步骤进度: uploaded, translating, llm_optimizing, completed, failed
@@ -1416,8 +1418,10 @@ class Material(db.Model):
             'pdfOriginalFile': self.pdf_original_file,
             # 实体识别相关
             'entityRecognitionEnabled': self.entity_recognition_enabled,
+            'entityRecognitionMode': self.entity_recognition_mode,  # ✅ 添加mode字段
             'entityRecognitionResult': entity_recognition,
             'entityRecognitionConfirmed': self.entity_recognition_confirmed,
+            'entityRecognitionTriggered': self.entity_recognition_triggered,  # ✅ 添加triggered字段
             'entityUserEdits': entity_edits,
             'entityRecognitionError': self.entity_recognition_error,
             # 处理进度
@@ -3790,19 +3794,24 @@ def upload_files(client_id):
                                                 final_size = os.path.getsize(jpg_path)
 
                                                 if final_size <= max_size:
-                                                    os.remove(img_path)
+                                                    # ⭐ 安全删除：确保不是同一个文件
+                                                    if img_path != jpg_path and os.path.exists(img_path):
+                                                        os.remove(img_path)
                                                     img_path = jpg_path
                                                     log_message(f"✓ 第 {page_num + 1} 页压缩完成: {final_size / 1024 / 1024:.2f}MB (质量: {best_quality})", "SUCCESS")
                                                 else:
                                                     try:
-                                                        os.remove(jpg_path)
+                                                        if os.path.exists(jpg_path) and jpg_path != img_path:
+                                                            os.remove(jpg_path)
                                                     except:
                                                         pass
                                                     raise Exception(f"第 {page_num + 1} 页图片过大")
                                             else:
                                                 # 文件较小，但仍压缩到合理质量（提高稳定性）
                                                 img.save(jpg_path, 'JPEG', quality=75, optimize=True)  # 从95降到75
-                                                os.remove(img_path)
+                                                # ⭐ 安全删除：确保不是同一个文件
+                                                if img_path != jpg_path and os.path.exists(img_path):
+                                                    os.remove(img_path)
                                                 img_path = jpg_path
                                                 final_size = os.path.getsize(jpg_path)
                                                 log_message(f"✓ 第 {page_num + 1} 页转换完成: {final_size / 1024 / 1024:.2f}MB", "SUCCESS")
@@ -3894,7 +3903,15 @@ def upload_files(client_id):
                             max_size = 2 * 1024 * 1024  # 降低到2MB
 
                             # 无论什么情况都转换并压缩
-                            jpg_path = file_path.rsplit('.', 1)[0] + '.jpg'
+                            # ⭐ 修复：避免jpg_path和file_path相同导致文件被删除
+                            base_path = file_path.rsplit('.', 1)[0]
+                            original_ext = file_path.rsplit('.', 1)[1] if '.' in file_path else ''
+
+                            # 如果原文件已经是jpg，使用临时文件名避免覆盖
+                            if original_ext.lower() in ['jpg', 'jpeg']:
+                                jpg_path = base_path + '_compressed.jpg'
+                            else:
+                                jpg_path = base_path + '.jpg'
 
                             if file_size > max_size:
                                 # 需要压缩：二分查找最佳质量
@@ -3917,16 +3934,21 @@ def upload_files(client_id):
                                 final_size = os.path.getsize(jpg_path)
 
                                 if final_size <= max_size:
-                                    os.remove(file_path)
+                                    # ⭐ 安全删除：确保不是同一个文件
+                                    if file_path != jpg_path and os.path.exists(file_path):
+                                        os.remove(file_path)
                                     file_path = jpg_path
                                     log_message(f"✓ 压缩完成: {final_size / 1024 / 1024:.2f}MB (质量: {best_quality})", "SUCCESS")
                                 else:
-                                    os.remove(jpg_path)
+                                    if os.path.exists(jpg_path) and jpg_path != file_path:
+                                        os.remove(jpg_path)
                                     raise Exception(f"图片压缩失败，仍超过2MB限制")
                             else:
                                 # 文件较小，但仍压缩到合理质量
                                 img.save(jpg_path, 'JPEG', quality=75, optimize=True)
-                                os.remove(file_path)
+                                # ⭐ 安全删除：确保不是同一个文件
+                                if file_path != jpg_path and os.path.exists(file_path):
+                                    os.remove(file_path)
                                 file_path = jpg_path
                                 final_size = os.path.getsize(jpg_path)
                                 log_message(f"✓ 压缩完成: {final_size / 1024 / 1024:.2f}MB", "SUCCESS")
@@ -4160,19 +4182,40 @@ def delete_material(material_id):
 @app.route('/api/clients/<client_id>/materials/translate', methods=['POST'])
 @jwt_required()
 def start_translation(client_id):
-    """开始翻译客户的材料（异步处理）"""
+    """开始翻译客户的材料（异步处理）
+
+    请求体（可选）:
+    {
+        "material_ids": ["id1", "id2"]  // 如果提供，只翻译指定的材料；否则翻译所有材料
+    }
+    """
     try:
         user_id = get_jwt_identity()
         client = Client.query.filter_by(id=client_id, user_id=user_id).first()
         if not client:
             return jsonify({'success': False, 'error': '客户不存在'}), 404
-        
-        # 获取该客户的所有图片和网页材料
-        materials = Material.query.filter(
-            Material.client_id == client_id,
-            Material.type.in_(['image', 'webpage'])
-        ).all()
-        
+
+        # 🔧 修复：支持只翻译指定的材料
+        # 使用silent=True避免Content-Type错误
+        data = request.get_json(silent=True) or {}
+        requested_material_ids = data.get('material_ids', [])
+
+        if requested_material_ids:
+            # 只翻译指定的材料
+            log_message(f"收到翻译请求，指定材料ID: {requested_material_ids}", "INFO")
+            materials = Material.query.filter(
+                Material.client_id == client_id,
+                Material.id.in_(requested_material_ids),
+                Material.type.in_(['image', 'webpage'])
+            ).all()
+        else:
+            # 翻译所有材料（原有行为）
+            log_message(f"收到翻译请求，翻译所有材料", "INFO")
+            materials = Material.query.filter(
+                Material.client_id == client_id,
+                Material.type.in_(['image', 'webpage'])
+            ).all()
+
         # 筛选需要翻译的材料（ID列表，避免在异步中使用对象）
         material_ids_to_translate = [m.id for m in materials if m.status in ['已上传', '已添加', '处理中']]
         
@@ -4332,6 +4375,7 @@ def start_translation(client_id):
                             MaterialStatus.TRANSLATED,
                             translation_text_info=translation_data,
                             translation_error=None,
+                            processing_step=ProcessingStep.TRANSLATED.value,  # 🔧 修复：设置processing_step
                             processing_progress=100
                         )
 
@@ -4373,8 +4417,19 @@ def start_translation(client_id):
                                     # 识别失败，记录错误但不阻止流程
                                     material.entity_recognition_error = entity_result.get('error')
                                     material.processing_step = ProcessingStep.TRANSLATED.value
+                                    material.entity_recognition_triggered = True  # 标记已尝试过
                                     db.session.commit()
                                     log_message(f"实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "WARN")
+
+                                    # 🔧 推送WebSocket更新，告知前端实体识别失败
+                                    if WEBSOCKET_ENABLED:
+                                        emit_material_updated(
+                                            material.client_id,
+                                            material.id,
+                                            processing_step=material.processing_step,
+                                            material=material.to_dict(),
+                                            entity_recognition_error=entity_result.get('error')
+                                        )
 
                             except Exception as e:
                                 # 实体识别异常，记录错误但不阻止流程
@@ -4383,7 +4438,18 @@ def start_translation(client_id):
                                 traceback.print_exc()
                                 material.entity_recognition_error = str(e)
                                 material.processing_step = ProcessingStep.TRANSLATED.value
+                                material.entity_recognition_triggered = True  # 标记已尝试过
                                 db.session.commit()
+
+                                # 🔧 推送WebSocket更新，告知前端实体识别失败
+                                if WEBSOCKET_ENABLED:
+                                    emit_material_updated(
+                                        material.client_id,
+                                        material.id,
+                                        processing_step=material.processing_step,
+                                        material=material.to_dict(),
+                                        entity_recognition_error=str(e)
+                                    )
 
                         return {'success': True}
 
@@ -5704,7 +5770,8 @@ def toggle_entity_recognition(material_id):
 
     请求体:
         {
-            "enabled": true/false
+            "enabled": true/false,
+            "mode": "standard" 或 "deep" (可选，默认为"standard")
         }
     """
     try:
@@ -5724,22 +5791,54 @@ def toggle_entity_recognition(material_id):
 
         data = request.get_json()
         enabled = data.get('enabled', False)
+        mode = data.get('mode', 'standard')  # 默认为standard模式
+
+        # 🔍 调试日志：接收到的参数
+        print(f"\n{'='*60}")
+        print(f"[DEBUG] enable-entity-recognition 接口调用")
+        print(f"材料ID: {material_id}")
+        print(f"接收参数: enabled={enabled}, mode={mode}")
+        print(f"当前状态: processing_step={material.processing_step}")
+        print(f"{'='*60}\n")
+
+        # 验证mode值
+        if mode not in ['standard', 'deep']:
+            return jsonify({'success': False, 'error': '无效的mode值，必须为standard或deep'}), 400
 
         material.entity_recognition_enabled = enabled
-        if not enabled:
+        if enabled:
+            # 如果启用，设置模式
+            material.entity_recognition_mode = mode
+            print(f"[DEBUG] ✅ 已设置 entity_recognition_mode = {mode}")
+        else:
             # 如果禁用，清除相关数据
+            material.entity_recognition_mode = None
             material.entity_recognition_result = None
             material.entity_recognition_confirmed = False
+            material.entity_recognition_triggered = False
             material.entity_user_edits = None
             material.entity_recognition_error = None
 
         db.session.commit()
 
-        log_message(f"材料 {material.name} 实体识别已{'启用' if enabled else '禁用'}", "INFO")
+        # 🔍 调试日志：保存后的值
+        print(f"[DEBUG] 数据库提交后:")
+        print(f"  entity_recognition_enabled = {material.entity_recognition_enabled}")
+        print(f"  entity_recognition_mode = {material.entity_recognition_mode}")
+        print(f"  to_dict()包含的值:")
+        material_dict = material.to_dict()
+        print(f"    entityRecognitionEnabled = {material_dict.get('entityRecognitionEnabled')}")
+        print(f"    entityRecognitionMode = {material_dict.get('entityRecognitionMode')}")
+        print(f"    processingStep = {material_dict.get('processingStep')}")
+
+        log_message(f"材料 {material.name} 实体识别已{'启用' if enabled else '禁用'}" +
+                   (f"，模式: {mode}" if enabled else ""), "INFO")
 
         return jsonify({
             'success': True,
             'enabled': enabled,
+            'mode': mode,  # ✅ 返回mode给前端
+            'material': material_dict,  # ✅ 返回完整material对象
             'message': f"实体识别已{'启用' if enabled else '禁用'}"
         })
 
@@ -6009,14 +6108,99 @@ def confirm_entities(material_id):
         material.entity_recognition_confirmed = True
         material.processing_step = ProcessingStep.ENTITY_CONFIRMED.value
 
+        # ⭐ 关键功能：如果是PDF，将translationGuidance应用到所有同一Session的页面
+        if material.pdf_session_id:
+            log_message(f"PDF Session检测到: {material.pdf_session_id}，应用translationGuidance到所有页面", "INFO")
+            session_materials = Material.query.filter_by(
+                pdf_session_id=material.pdf_session_id
+            ).all()
+
+            affected_count = 0
+            for mat in session_materials:
+                if mat.id != material.id:  # 跳过当前材料（已经设置过了）
+                    mat.entity_user_edits = json.dumps(user_edits, ensure_ascii=False)
+                    mat.entity_recognition_confirmed = True
+                    if mat.processing_step == ProcessingStep.ENTITY_PENDING_CONFIRM.value:
+                        mat.processing_step = ProcessingStep.ENTITY_CONFIRMED.value
+                    affected_count += 1
+
+            log_message(f"已为 {affected_count} 个PDF页面应用相同的translationGuidance", "INFO")
+
         db.session.commit()
 
         log_message(f"实体识别已确认: {material.name}", "INFO")
 
+        # ⭐ 自动触发LLM翻译
+        try:
+            from threading import Thread
+            log_message(f"自动触发LLM翻译: {material.name}", "INFO")
+
+            # 创建线程异步执行LLM翻译
+            def trigger_llm_translation():
+                with app.app_context():
+                    try:
+                        # 更新状态为LLM翻译中
+                        mat = Material.query.get(material_id)
+                        if mat:
+                            mat.processing_step = ProcessingStep.LLM_TRANSLATING.value
+                            db.session.commit()
+
+                            # WebSocket推送
+                            if WEBSOCKET_ENABLED:
+                                emit_llm_started(material_id, progress=70)
+
+                        # 执行LLM翻译
+                        baidu_result = json.loads(mat.translation_text_info)
+                        regions = baidu_result.get('regions', [])
+
+                        # 读取实体识别指导
+                        entity_guidance = None
+                        if mat.entity_user_edits:
+                            entity_data = json.loads(mat.entity_user_edits)
+                            entity_guidance = entity_data.get('translationGuidance', {})
+
+                        from llm_service import LLMTranslationService
+                        llm_service = LLMTranslationService(output_folder='outputs')
+                        llm_translations = llm_service.optimize_translations(regions, entity_guidance=entity_guidance)
+
+                        # 保存结果
+                        mat.llm_translation_result = json.dumps(llm_translations, ensure_ascii=False)
+                        mat.processing_step = ProcessingStep.LLM_TRANSLATED.value
+                        mat.processing_progress = 100
+                        mat.status = MaterialStatus.TRANSLATED.value
+                        db.session.commit()
+
+                        # WebSocket推送完成
+                        if WEBSOCKET_ENABLED:
+                            emit_llm_completed(material_id, llm_translations, progress=100)
+
+                        log_message(f"自动LLM翻译完成: {mat.name}", "SUCCESS")
+
+                    except Exception as e:
+                        log_message(f"自动触发LLM翻译失败: {str(e)}", "ERROR")
+                        import traceback
+                        traceback.print_exc()
+
+                        # 标记失败
+                        mat = Material.query.get(material_id)
+                        if mat:
+                            mat.status = MaterialStatus.FAILED.value
+                            mat.processing_step = ProcessingStep.FAILED.value
+                            mat.translation_error = f"LLM翻译失败: {str(e)}"
+                            db.session.commit()
+
+            thread = Thread(target=trigger_llm_translation)
+            thread.daemon = True
+            thread.start()
+
+        except Exception as e:
+            log_message(f"启动LLM翻译线程失败: {str(e)}", "WARNING")
+
         return jsonify({
             'success': True,
-            'message': '实体识别已确认，可以继续进行LLM翻译',
-            'canProceedToLLM': True
+            'message': '实体识别已确认，LLM翻译已自动启动',
+            'canProceedToLLM': True,
+            'autoStartedLLM': True
         })
 
     except Exception as e:
@@ -6038,6 +6222,11 @@ def entity_recognition_fast(material_id):
     仅识别实体，不进行深度搜索
     """
     try:
+        print(f"\n{'='*80}")
+        print(f"[DEBUG] ========== 快速实体识别开始 ==========")
+        print(f"[DEBUG] 材料ID: {material_id}")
+        print(f"{'='*80}\n")
+
         current_user_id = get_jwt_identity()
         user = User.query.get(current_user_id)
         if not user:
@@ -6046,6 +6235,13 @@ def entity_recognition_fast(material_id):
         material = Material.query.get(material_id)
         if not material:
             return jsonify({'success': False, 'error': '材料不存在'}), 404
+
+        # 🔍 调试日志：当前状态
+        print(f"[DEBUG] 当前状态:")
+        print(f"  processing_step = {material.processing_step}")
+        print(f"  entity_recognition_enabled = {material.entity_recognition_enabled}")
+        print(f"  entity_recognition_mode = {material.entity_recognition_mode}")
+        print(f"  entity_recognition_triggered = {material.entity_recognition_triggered}")
 
         # 验证权限
         client = Client.query.get(material.client_id)
@@ -6059,18 +6255,65 @@ def entity_recognition_fast(material_id):
         # 解析OCR结果
         ocr_result = json.loads(material.translation_text_info)
 
-        # 调用快速实体识别服务
+        # ⭐ 1. 设置状态为识别中
+        material.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+        material.entity_recognition_triggered = True
+        db.session.commit()
+
+        # WebSocket推送状态更新
+        if WEBSOCKET_ENABLED:
+            emit_material_updated(
+                material.client_id,
+                material.id,
+                processing_step=material.processing_step,
+                material=material.to_dict()  # ✅ 传递完整的material对象
+            )
+
+        # 2. 调用快速实体识别服务
         from entity_recognition_service import EntityRecognitionService
         entity_service = EntityRecognitionService()
         entity_result = entity_service.recognize_entities(ocr_result, mode="fast")
 
         if entity_result.get('success'):
+            print(f"\n[DEBUG] ========== 设置状态为 entity_pending_confirm ==========")
+
+            # ⭐ 3. 保存结果并设置状态为等待确认
+            material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
+            material.processing_step = ProcessingStep.ENTITY_PENDING_CONFIRM.value  # ✅ 关键：设置为待确认
+            db.session.commit()
+
+            print(f"[DEBUG] ✅ 已设置: processing_step = {material.processing_step}")
+            print(f"[DEBUG] ✅ 已保存: entity_recognition_mode = {material.entity_recognition_mode}")
+            print(f"[DEBUG] ✅ 已保存: entity_recognition_result 包含 {entity_result.get('total_entities', 0)} 个实体")
+
+            # ⭐ 4. WebSocket推送更新（包含完整material对象）
+            material_dict = material.to_dict()
+
+            print(f"\n[DEBUG] ========== 准备推送 WebSocket ==========")
+            print(f"[DEBUG] 推送数据:")
+            print(f"  processingStep = {material_dict.get('processingStep')}")
+            print(f"  entityRecognitionMode = {material_dict.get('entityRecognitionMode')}")
+            print(f"  entityRecognitionEnabled = {material_dict.get('entityRecognitionEnabled')}")
+            print(f"  entityRecognitionResult 包含实体数: {len(material_dict.get('entityRecognitionResult', {}).get('entities', []))}")
+            print(f"  client_id = {material.client_id}")
+            print(f"  material_id = {material.id}")
+
+            if WEBSOCKET_ENABLED:
+                emit_material_updated(
+                    material.client_id,
+                    material.id,
+                    processing_step=material.processing_step,
+                    material=material_dict  # ✅ 传递完整的material对象
+                )
+                print(f"[DEBUG] ✅ WebSocket已推送")
+
             log_message(f"快速实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体", "INFO")
 
             return jsonify({
                 'success': True,
                 'result': entity_result,
                 'mode': 'fast',
+                'material': material.to_dict(),  # ✅ 返回完整material对象
                 'message': '快速识别完成，您可以选择AI深度查询或人工调整'
             })
         else:
@@ -6122,17 +6365,50 @@ def entity_recognition_deep(material_id):
         # 解析OCR结果
         ocr_result = json.loads(material.translation_text_info)
 
-        # 调用深度实体识别服务
+        # ⭐ 1. 设置状态为识别中
+        material.processing_step = ProcessingStep.ENTITY_RECOGNIZING.value
+        material.entity_recognition_triggered = True
+        db.session.commit()
+
+        # WebSocket推送状态更新
+        if WEBSOCKET_ENABLED:
+            emit_material_updated(
+                material.client_id,
+                material.id,
+                processing_step=material.processing_step,
+                material=material.to_dict()  # ✅ 传递完整的material对象
+            )
+
+        # 2. 调用深度实体识别服务
         from entity_recognition_service import EntityRecognitionService
         entity_service = EntityRecognitionService()
         entity_result = entity_service.recognize_entities(ocr_result, mode="deep")
 
         if entity_result.get('success'):
-            # 保存深度识别结果
+            # ⭐ 3. 保存深度识别结果并自动确认
             material.entity_recognition_result = json.dumps(entity_result, ensure_ascii=False)
             material.entity_recognition_confirmed = True  # 深度查询自动确认
             material.processing_step = ProcessingStep.ENTITY_CONFIRMED.value
+
+            # 保存translationGuidance（从实体结果中提取）
+            if entity_result.get('translationGuidance'):
+                user_edits = {
+                    'entities': entity_result.get('entities', []),
+                    'translationGuidance': entity_result.get('translationGuidance', {}),
+                    'confirmedAt': datetime.utcnow().isoformat()
+                }
+                material.entity_user_edits = json.dumps(user_edits, ensure_ascii=False)
+
             db.session.commit()
+
+            # ⭐ 4. WebSocket推送更新
+            if WEBSOCKET_ENABLED:
+                emit_material_updated(
+                    material.client_id,
+                    material.id,
+                    processing_step=material.processing_step,
+                    material=material.to_dict()  # ✅ 传递完整的material对象
+                )
 
             # 保存日志
             entity_service.save_entity_recognition_log(
@@ -6144,11 +6420,71 @@ def entity_recognition_deep(material_id):
 
             log_message(f"深度实体识别完成: {material.name}, 识别到 {entity_result.get('total_entities', 0)} 个实体", "INFO")
 
+            # ⭐ 5. 自动触发LLM翻译（深度模式全自动）
+            try:
+                from threading import Thread
+                log_message(f"深度模式：自动触发LLM翻译: {material.name}", "INFO")
+
+                def trigger_llm_translation():
+                    with app.app_context():
+                        try:
+                            mat = Material.query.get(material_id)
+                            if mat:
+                                mat.processing_step = ProcessingStep.LLM_TRANSLATING.value
+                                db.session.commit()
+
+                                if WEBSOCKET_ENABLED:
+                                    emit_llm_started(material_id, progress=70)
+
+                            baidu_result = json.loads(mat.translation_text_info)
+                            regions = baidu_result.get('regions', [])
+
+                            entity_guidance = None
+                            if mat.entity_user_edits:
+                                entity_data = json.loads(mat.entity_user_edits)
+                                entity_guidance = entity_data.get('translationGuidance', {})
+
+                            from llm_service import LLMTranslationService
+                            llm_service = LLMTranslationService(output_folder='outputs')
+                            llm_translations = llm_service.optimize_translations(regions, entity_guidance=entity_guidance)
+
+                            mat.llm_translation_result = json.dumps(llm_translations, ensure_ascii=False)
+                            mat.processing_step = ProcessingStep.LLM_TRANSLATED.value
+                            mat.processing_progress = 100
+                            mat.status = MaterialStatus.TRANSLATED.value
+                            db.session.commit()
+
+                            if WEBSOCKET_ENABLED:
+                                emit_llm_completed(material_id, llm_translations, progress=100)
+
+                            log_message(f"深度模式：自动LLM翻译完成: {mat.name}", "SUCCESS")
+
+                        except Exception as e:
+                            log_message(f"深度模式：自动LLM翻译失败: {str(e)}", "ERROR")
+                            import traceback
+                            traceback.print_exc()
+
+                            mat = Material.query.get(material_id)
+                            if mat:
+                                mat.status = MaterialStatus.FAILED.value
+                                mat.processing_step = ProcessingStep.FAILED.value
+                                mat.translation_error = f"LLM翻译失败: {str(e)}"
+                                db.session.commit()
+
+                thread = Thread(target=trigger_llm_translation)
+                thread.daemon = True
+                thread.start()
+
+            except Exception as e:
+                log_message(f"深度模式：启动LLM翻译线程失败: {str(e)}", "WARNING")
+
             return jsonify({
                 'success': True,
                 'result': entity_result,
                 'mode': 'deep',
-                'message': '深度识别完成，已自动确认，可直接进行LLM翻译'
+                'material': material.to_dict(),  # ✅ 返回完整material对象
+                'autoStartedLLM': True,  # ✅ 告知前端已自动启动LLM
+                'message': '深度识别完成，已自动确认，LLM翻译已自动启动'
             })
         else:
             log_message(f"深度实体识别失败: {material.name}, 错误: {entity_result.get('error')}", "ERROR")
