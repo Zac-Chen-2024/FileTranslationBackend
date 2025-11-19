@@ -738,6 +738,10 @@ def update_material_status(material, status, **kwargs):
         # 提交到数据库
         db.session.commit()
 
+        # 🔧 清除API缓存，确保前端获取最新数据
+        cache_key = f"client_materials_{material.client_id}"
+        api_cache.delete(cache_key)
+
         # WebSocket推送（如果启用）
         emit_websocket = kwargs.get('emit_websocket', True)
         if emit_websocket and WEBSOCKET_ENABLED:
