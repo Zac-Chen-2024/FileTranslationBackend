@@ -3,6 +3,7 @@
 """
 from flask import Blueprint, request, jsonify, current_app as app
 from services.image_processor import ImageProcessor
+from services.advanced_text_detector import AdvancedTextDetector
 import traceback
 import json
 
@@ -67,8 +68,16 @@ def upload_and_separate():
                 'error': '文件大小超过10MB限制'
             }), 400
 
-        # 调用图片处理服务
-        result = ImageProcessor.separate_background_text(image_bytes)
+        # 检查是否使用高级检测
+        use_advanced = request.args.get('advanced', 'false').lower() == 'true'
+
+        if use_advanced:
+            # 使用高级文字检测器
+            detector = AdvancedTextDetector()
+            result = detector.detect_text_regions(image_bytes)
+        else:
+            # 使用原始图片处理服务
+            result = ImageProcessor.separate_background_text(image_bytes)
 
         return jsonify({
             'success': True,
