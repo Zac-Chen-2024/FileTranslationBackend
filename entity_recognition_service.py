@@ -55,19 +55,22 @@ class EntityRecognitionService:
                     "sourceLang": "zh",
                     "targetLang": "en"
                 }
-            mode: 查询模式 - "fast"(快速), "deep"(深度), "manual_adjust"(人工调整模式)
+            mode: 查询模式（兼容旧接口，内部会映射到 Entity API 的模式）
+                - "fast" -> 映射到 Entity API 的 "identify" 模式（快速识别，~30秒）
+                - "deep" -> 映射到 Entity API 的 "analyze" 模式（深度分析，~1-2分钟）
+                - "manual_adjust" -> 用户编辑后的深度分析（使用 "analyze" 模式）
 
         Returns:
             实体识别结果，格式：
                 {
                     "success": True/False,
-                    "mode": "fast/deep/manual_adjust",
+                    "mode": "identify" | "analyze",
                     "entities": [
                         {
                             "chinese_name": "腾讯公司",
-                            "english_name": "Tencent Holdings Limited",
-                            "source": "https://www.tencent.com/",
-                            "confidence": "high",
+                            "english_name": "Tencent Holdings Limited",  # identify模式为None
+                            "source": "https://www.tencent.com/",  # identify模式为None
+                            "confidence": "high",  # identify模式为None
                             "type": "ORGANIZATION"
                         }
                     ],
@@ -89,8 +92,8 @@ class EntityRecognitionService:
             else:
                 raise ValueError(f"不支持的模式: {mode}")
 
-            result['mode'] = mode
-            print(f"[实体识别] {mode}模式完成，识别到 {result.get('total_entities', 0)} 个实体")
+            # 不覆盖 API 返回的 mode，保持 Entity API 的实际模式（'identify' 或 'analyze'）
+            print(f"[实体识别] {mode}模式 → {result.get('mode')}模式完成，识别到 {result.get('total_entities', 0)} 个实体")
             return result
 
         except Exception as e:
@@ -191,6 +194,7 @@ class EntityRecognitionService:
     def _call_fast_query(self, ocr_result: Dict) -> Dict:
         """
         快速查询模式 - 快速识别实体但不进行深度搜索
+        对应 Entity API 的 "identify" 模式
 
         Args:
             ocr_result: OCR识别结果
@@ -198,11 +202,12 @@ class EntityRecognitionService:
         Returns:
             快速识别的实体结果
         """
-        return self._call_company_query_api(ocr_result, mode="fast")
+        return self._call_company_query_api(ocr_result, mode="identify")
 
     def _call_deep_query(self, ocr_result: Dict) -> Dict:
         """
         深度查询模式 - 进行完整的Google搜索和官网分析
+        对应 Entity API 的 "analyze" 模式
 
         Args:
             ocr_result: OCR识别结果
@@ -210,84 +215,74 @@ class EntityRecognitionService:
         Returns:
             深度查询的实体结果，包含准确的官方英文名称
         """
-        return self._call_company_query_api(ocr_result, mode="deep")
+        return self._call_company_query_api(ocr_result, mode="analyze")
 
     def _call_manual_adjust(self, ocr_result: Dict) -> Dict:
         """
-        人工调整模式 - 基于fast结果进行AI优化
+        人工调整模式 - 对用户编辑后的实体列表进行深度分析
+
+        注意：Entity API 没有单独的 manual_adjust 模式。
+        这个模式实际上是：先用 identify 快速识别，用户编辑后，
+        再用 analyze 模式对选定的实体进行深度分析。
+
+        这里直接使用 analyze 模式进行深度查询。
 
         Args:
-            ocr_result: OCR识别结果（应该包含fast查询的结果）
+            ocr_result: OCR识别结果（可能包含用户编辑的实体列表）
 
         Returns:
-            AI优化后的实体结果
+            深度分析后的实体结果
         """
-        return self._call_company_query_api(ocr_result, mode="manual_adjust")
+        # 如果 ocr_result 中包含用户编辑的实体列表，使用两阶段查询
+        if 'user_entities' in ocr_result and ocr_result['user_entities']:
+            return self._call_analyze_with_entities(ocr_result['user_entities'])
+        else:
+            # 否则，直接对整个文本进行 analyze
+            return self._call_company_query_api(ocr_result, mode="analyze")
 
-    def _call_company_query_api(self, ocr_result: Dict, mode: str = "fast") -> Dict:
+    def _call_analyze_with_entities(self, entities_list: List[str]) -> Dict:
         """
-        调用公司查询API（https://tns.drziangchen.uk/api/entity/analyze）
+        两阶段查询的第二阶段：直接提供实体列表进行深度分析
+
+        这对应 Entity API 的推荐工作流：
+        1. 第一阶段：使用 identify 模式快速识别所有实体
+        2. 用户选择/编辑感兴趣的实体
+        3. 第二阶段：使用此方法对选定实体进行深度分析
 
         Args:
-            ocr_result: OCR识别结果
+            entities_list: 实体名称列表，如 ["腾讯公司", "阿里巴巴"]
 
         Returns:
-            实体识别结果，格式：
-                {
-                    "success": True,
-                    "entities": [
-                        {
-                            "chinese_name": "腾讯",
-                            "english_name": "Tencent Holdings Limited",
-                            "source": "https://www.tencent.com/",
-                            "confidence": "high",
-                            "type": "ORGANIZATION"
-                        }
-                    ],
-                    "total_entities": 2,
-                    "processing_time": 1.23
-                }
+            深度分析结果
         """
         start_time = time.time()
 
-        # 合并所有region的文本
-        regions = ocr_result.get("regions", [])
-        all_text = " ".join([r.get('src', '') for r in regions if r.get('src')])
-
-        if not all_text.strip():
+        if not entities_list:
             return {
                 "success": True,
+                "mode": "analyze",
                 "entities": [],
                 "total_entities": 0,
                 "processing_time": 0,
                 "error": None
             }
 
-        print(f"[实体识别] 合并后的文本: {all_text[:200]}...")
+        print(f"[实体识别] 两阶段查询 - 对 {len(entities_list)} 个实体进行深度分析")
+        print(f"[实体识别] 实体列表: {entities_list}")
 
         # 准备API请求
         headers = {"Content-Type": "application/json"}
 
-        # 准备API请求payload
-        # 注意：当前API可能不支持mode参数，需要通过其他方式区分模式
+        # 根据 Entity API 的两阶段查询规范
         payload = {
-            "text": f"公司查询：{all_text}"
+            "entities": entities_list,  # 直接提供实体数组
+            "mode": "analyze"  # 深度分析模式
         }
 
-        # TODO: 根据实际API文档，添加不同模式的参数
-        # 例如：
-        # - fast模式可能需要参数 "quick": true
-        # - deep模式可能需要参数 "thorough": true
-        # - manual_adjust模式可能需要传递已有结果
-
-        print(f"[实体识别] 模式: {mode}, Payload: {payload}")
-
         print(f"[实体识别] 调用API: {self.api_url}")
-        print(f"[实体识别] 注意：API可能需要较长时间响应（Google搜索延迟）")
+        print(f"[实体识别] Payload: {payload}")
 
         try:
-            # 调用公司查询API
-            # 注意：由于需要进行Google搜索，此API可能响应较慢
             response = requests.post(
                 self.api_url,
                 headers=headers,
@@ -313,6 +308,160 @@ class EntityRecognitionService:
 
                 return {
                     "success": True,
+                    "mode": "analyze",
+                    "entities": entities,
+                    "total_entities": api_result.get('count', len(entities)),
+                    "processing_time": processing_time,
+                    "error": None
+                }
+            else:
+                return {
+                    "success": False,
+                    "mode": "analyze",
+                    "entities": [],
+                    "total_entities": 0,
+                    "processing_time": time.time() - start_time,
+                    "error": api_result.get('error', 'API调用失败')
+                }
+
+        except requests.exceptions.Timeout:
+            return {
+                "success": False,
+                "mode": "analyze",
+                "entities": [],
+                "total_entities": 0,
+                "processing_time": time.time() - start_time,
+                "error": f"API调用超时（超过{self.timeout}秒）"
+            }
+        except requests.exceptions.RequestException as e:
+            return {
+                "success": False,
+                "mode": "analyze",
+                "entities": [],
+                "total_entities": 0,
+                "processing_time": time.time() - start_time,
+                "error": f"API调用失败: {str(e)}"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "mode": "analyze",
+                "entities": [],
+                "total_entities": 0,
+                "processing_time": time.time() - start_time,
+                "error": f"处理异常: {str(e)}"
+            }
+
+    def _call_company_query_api(self, ocr_result: Dict, mode: str = "identify") -> Dict:
+        """
+        调用公司查询API（https://tns.drziangchen.uk/api/entity/analyze）
+
+        Args:
+            ocr_result: OCR识别结果
+            mode: 查询模式 - "identify" (快速识别) 或 "analyze" (深度分析)
+
+        Returns:
+            实体识别结果，格式：
+                {
+                    "success": True,
+                    "mode": "identify" | "analyze",
+                    "entities": [
+                        # identify模式：
+                        {"entity": "腾讯公司"}
+                        # analyze模式：
+                        {
+                            "chinese_name": "腾讯",
+                            "english_name": "Tencent Holdings Limited",
+                            "source": "https://www.tencent.com/",
+                            "confidence": "high",
+                            "type": "ORGANIZATION"
+                        }
+                    ],
+                    "total_entities": 2,
+                    "processing_time": 1.23
+                }
+        """
+        start_time = time.time()
+
+        # 合并所有region的文本
+        regions = ocr_result.get("regions", [])
+        all_text = " ".join([r.get('src', '') for r in regions if r.get('src')])
+
+        if not all_text.strip():
+            return {
+                "success": True,
+                "mode": mode,
+                "entities": [],
+                "total_entities": 0,
+                "processing_time": 0,
+                "error": None
+            }
+
+        print(f"[实体识别] 合并后的文本: {all_text[:200]}...")
+
+        # 准备API请求
+        headers = {"Content-Type": "application/json"}
+
+        # 根据 Entity API 规范构建 payload
+        # 支持两种模式：identify (快速) 和 analyze (深度)
+        payload = {
+            "text": f"公司查询：{all_text}",
+            "mode": mode  # "identify" 或 "analyze"
+        }
+
+        print(f"[实体识别] 模式: {mode}, Payload: {payload}")
+
+        print(f"[实体识别] 调用API: {self.api_url}")
+        print(f"[实体识别] 注意：API可能需要较长时间响应（Google搜索延迟）")
+
+        try:
+            # 调用公司查询API
+            # 注意：由于需要进行Google搜索，此API可能响应较慢
+            response = requests.post(
+                self.api_url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout
+            )
+
+            response.raise_for_status()
+            api_result = response.json()
+
+            print(f"[实体识别] API响应: {api_result}")
+
+            # 转换API返回格式
+            if api_result.get('success'):
+                entities = api_result.get('entities', [])
+                api_mode = api_result.get('mode', mode)
+
+                # 根据不同模式处理响应
+                if api_mode == 'identify':
+                    # identify模式返回格式：[{"entity": "腾讯公司"}]
+                    # 转换为统一格式
+                    normalized_entities = []
+                    for entity in entities:
+                        normalized_entities.append({
+                            "chinese_name": entity.get('entity', ''),
+                            "english_name": None,  # identify模式不提供英文名
+                            "source": None,
+                            "confidence": None,
+                            "type": "ORGANIZATION"
+                        })
+                    entities = normalized_entities
+
+                elif api_mode == 'analyze':
+                    # analyze模式返回格式：
+                    # [{"chinese_name": "...", "english_name": "...", "source": "...", "confidence": "high"}]
+                    # 为每个实体添加type字段（默认为ORGANIZATION）
+                    for entity in entities:
+                        if 'type' not in entity:
+                            entity['type'] = 'ORGANIZATION'
+
+                processing_time = time.time() - start_time
+
+                return {
+                    "success": True,
+                    "mode": api_mode,
                     "entities": entities,
                     "total_entities": api_result.get('count', len(entities)),
                     "processing_time": processing_time,
@@ -322,6 +471,7 @@ class EntityRecognitionService:
                 # API返回失败
                 return {
                     "success": False,
+                    "mode": mode,
                     "entities": [],
                     "total_entities": 0,
                     "processing_time": time.time() - start_time,

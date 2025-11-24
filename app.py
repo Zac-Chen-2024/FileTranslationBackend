@@ -96,7 +96,9 @@ except ImportError:
 
 # 创建Flask应用
 app = Flask(__name__)
-CORS(app, origins=["https://zac-chen-2024.github.io"], supports_credentials=True)
+CORS(app, origins=[
+    "https://zac-chen-2024.github.io"  # GitHub Pages (开发端和生产端共用同一个域名)
+], supports_credentials=True)
 
 # ✅ 初始化 SocketIO（使用长轮询，不需要WebSocket）
 socketio = SocketIO(app,
@@ -8034,8 +8036,13 @@ def handle_exception(e):
 
 # ========== 路由映射 ==========
 # 添加所有路由映射
-app.add_url_rule('/api/clients/<client_id>/export', 'export_client_materials', 
+app.add_url_rule('/api/clients/<client_id>/export', 'export_client_materials',
                 export_client_materials, methods=['GET'])
+
+# ========== 注册蓝图 ==========
+# 图片背景文字分离功能
+from routes.image_separation import image_separation_bp
+app.register_blueprint(image_separation_bp)
 
 if __name__ == '__main__':
     # 确保工作目录在脚本所在目录
