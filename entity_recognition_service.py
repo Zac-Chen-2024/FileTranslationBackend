@@ -113,84 +113,6 @@ class EntityRecognitionService:
                 "message": "实体识别服务暂时不可用，但翻译流程可以继续"
             }
 
-    def _call_entity_recognition_api_stub(self, ocr_result: Dict) -> Dict:
-        """
-        实体识别API调用的桩实现（Stub）
-
-        这是一个临时实现，返回模拟数据。
-        未来需要替换为真实的API调用。
-
-        Args:
-            ocr_result: OCR识别结果
-
-        Returns:
-            模拟的实体识别结果
-        """
-        start_time = time.time()
-
-        # 提取所有文本区域
-        regions = ocr_result.get("regions", [])
-
-        # 模拟实体识别结果
-        entities_result = []
-
-        for idx, region in enumerate(regions):
-            src_text = region.get("src", "")
-
-            # 模拟实体识别：简单的关键词匹配（未来需要替换为真实API）
-            detected_entities = self._stub_detect_entities(src_text)
-
-            if detected_entities:
-                entities_result.append({
-                    "region_id": idx,
-                    "text": src_text,
-                    "entities": detected_entities
-                })
-
-        processing_time = time.time() - start_time
-        total_entities = sum(len(r["entities"]) for r in entities_result)
-
-        return {
-            "success": True,
-            "entities": entities_result,
-            "total_entities": total_entities,
-            "processing_time": processing_time,
-            "error": None,
-            "note": "这是模拟数据，实际API未对接"
-        }
-
-    def _stub_detect_entities(self, text: str) -> List[Dict]:
-        """
-        模拟实体检测（桩实现）
-
-        未来需要替换为真实的实体识别逻辑
-
-        Args:
-            text: 待识别的文本
-
-        Returns:
-            实体列表
-        """
-        entities = []
-
-        # 简单的示例：检测常见的中文人名模式
-        # TODO: 替换为真实的实体识别API
-        sample_persons = ["张三", "李四", "王五", "张伟", "刘明"]
-        for person in sample_persons:
-            if person in text:
-                pos = text.index(person)
-                entities.append({
-                    "type": "PERSON",
-                    "value": person,
-                    "start": pos,
-                    "end": pos + len(person),
-                    "confidence": 0.9,
-                    "translation_suggestion": f"{person} (transliteration)",
-                    "context": "人名"
-                })
-
-        return entities
-
     def _call_fast_query(self, ocr_result: Dict) -> Dict:
         """
         快速查询模式 - 快速识别实体但不进行深度搜索
@@ -503,48 +425,6 @@ class EntityRecognitionService:
                 "error": f"处理异常: {str(e)}"
             }
 
-    def _call_real_api(self, ocr_result: Dict) -> Dict:
-        """
-        调用真实的实体识别API
-
-        这个函数将在未来实现，当前不调用。
-
-        Args:
-            ocr_result: OCR识别结果
-
-        Returns:
-            实体识别结果
-
-        Raises:
-            NotImplementedError: 当前未实现
-        """
-        # 准备API请求
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "ocr_result": ocr_result,
-            "source_lang": ocr_result.get("sourceLang", "zh"),
-            "target_lang": ocr_result.get("targetLang", "en"),
-            "options": {
-                "entity_types": ["PERSON", "LOCATION", "ORGANIZATION", "TERM"],
-                "return_translation_suggestions": True
-            }
-        }
-
-        # 调用API
-        response = requests.post(
-            self.api_url,
-            headers=headers,
-            json=payload,
-            timeout=self.timeout
-        )
-
-        response.raise_for_status()
-        return response.json()
-
     def save_entity_recognition_log(self, material_id: str, material_name: str,
                                    ocr_result: Dict, entity_result: Dict):
         """
@@ -670,16 +550,18 @@ Content-Type: application/json
 }
 ```
 
-### 2. 集成步骤
+### 2. 当前实现状态
 
-1. **获取API密钥**：联系实体识别API提供商获取API密钥
-2. **配置API密钥**：将密钥保存到 `config/entity_recognition_api_key.txt`
-3. **修改代码**：
-   - 在 `recognize_entities()` 方法中，将 `_call_entity_recognition_api_stub()`
-     替换为 `_call_real_api()`
-   - 更新 `_call_real_api()` 中的API端点和请求格式
-4. **测试**：使用真实数据测试API调用
-5. **错误处理**：添加重试机制和错误处理逻辑
+**注意**: 实体识别API已集成完成，使用 `_call_company_query_api()` 方法调用外部API。
+
+当前实现:
+- `recognize_entities()` 方法根据mode参数调用不同的查询方法
+- `_call_fast_query()` -> 调用 Entity API 的 "identify" 模式（快速识别）
+- `_call_deep_query()` -> 调用 Entity API 的 "analyze" 模式（深度分析）
+- `_call_manual_adjust()` -> 用户编辑后的深度分析
+- `_call_company_query_api()` -> 实际的API调用实现
+
+API端点: https://tns.drziangchen.uk/api/entity/analyze
 
 ### 3. 实体类型定义
 

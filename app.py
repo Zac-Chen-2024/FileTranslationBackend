@@ -143,29 +143,6 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# 暂时注释掉，等模型定义完成后再调用
-# def refresh_database_metadata():
-#     """强制刷新数据库元数据，解决SQLAlchemy缓存问题"""
-#     try:
-#         with app.app_context():
-#             # 关闭现有连接
-#             db.engine.dispose()
-#             
-#             # 清除元数据缓存
-#             db.metadata.clear()
-#             
-#             # 重新反射表结构
-#             db.metadata.reflect(bind=db.engine)
-#             
-#             # 确保所有表都被创建
-#             db.create_all()
-#             
-#             print("数据库元数据已刷新")
-#             return True
-#     except Exception as e:
-#         print(f"刷新元数据失败: {e}")
-#         return False
-
 # 添加请求日志中间件
 @app.before_request
 def log_request_info():
@@ -2904,58 +2881,6 @@ class SimpleTranslator:
                 'error': f'GPT网页翻译失败: {str(e)}'
             }
     
-    # ========== DEPRECATED: 保留以备后用 ==========
-    # 旧的百度图片翻译方法，已被 translate_image_reference() 替代
-    # def translate_image_baidu(self, image_path, from_lang='en', to_lang='zh'):
-    #     """百度图片翻译（完整版）"""
-    #     try:
-    #         log_message(f"开始百度图片翻译: {image_path}", "INFO")
-    #
-    #         # 创建百度翻译器实例
-    #         baidu_translator = BaiduImageTranslator(
-    #             api_key=self.api_keys.get('BAIDU_API_KEY'),
-    #             secret_key=self.api_keys.get('BAIDU_SECRET_KEY')
-    #         )
-    #
-    #         # 获取access token
-    #         if not baidu_translator.get_access_token():
-    #             return {
-    #                 'success': False,
-    #                 'error': '百度API密钥未配置或无效'
-    #             }
-    #
-    #         # 调用完整的翻译流程
-    #         result = baidu_translator.translate_image_complete(
-    #             image_path=image_path,
-    #             from_lang=from_lang,
-    #             to_lang=to_lang,
-    #             save_image=True
-    #         )
-    #
-    #         if result['success']:
-    #             log_message(f"百度图片翻译成功: {image_path}", "SUCCESS")
-    #             return {
-    #                 'success': True,
-    #                 'message': '百度图片翻译完成',
-    #                 'original_image': result['original_image'],
-    #                 'translated_image': result.get('translated_image'),
-    #                 'text_info': result['text_info'],
-    #                 'translation_direction': f"{from_lang} -> {to_lang}",
-    #                 'has_translated_image': bool(result.get('translated_image'))
-    #             }
-    #         else:
-    #             return {
-    #                 'success': False,
-    #                 'error': result.get('error', '翻译失败')
-    #             }
-    #
-    #     except Exception as e:
-    #         log_message(f"百度图片翻译失败: {str(e)}", "ERROR")
-    #         return {
-    #             'success': False,
-    #             'error': f'百度图片翻译失败: {str(e)}'
-    #         }
-
 # 延迟初始化翻译器实例
 translator = None
 
