@@ -4133,7 +4133,15 @@ def delete_material(material_id):
 @app.route('/api/clients/<client_id>/materials/translate', methods=['POST'])
 @jwt_required()
 def start_translation(client_id):
-    """开始翻译客户的材料（异步处理）
+    """
+    [部分废弃] 开始翻译客户的材料（异步处理）
+
+    ⚠️ 对于单页图片翻译，建议使用原子化API：
+    - POST /api/materials/<id>/translate-baidu（执行OCR翻译）
+    - POST /api/materials/<id>/entity/recognize（执行实体识别）
+    - POST /api/materials/<id>/llm/optimize（执行LLM优化）
+
+    此API仍用于PDF批量翻译，但单页图片应迁移到原子化API。
 
     请求体（可选）:
     {
@@ -6089,30 +6097,24 @@ def get_entity_recognition_result(material_id):
 @jwt_required()
 def confirm_entities(material_id):
     """
-    用户确认/编辑实体识别结果（卡关步骤的确认）
+    [已废弃] 用户确认/编辑实体识别结果（卡关步骤的确认）
+
+    ⚠️ 此API已废弃，请使用原子化API：
+    - POST /api/materials/<id>/entity/confirm（只确认实体）
+    - POST /api/materials/<id>/llm/optimize（执行LLM优化）
+
+    此API仍可用于向后兼容，但会自动触发LLM翻译（隐式副作用）。
+    新代码应使用原子化API以获得更好的控制。
 
     请求体:
         {
-            "entities": [
-                {
-                    "region_id": 0,
-                    "entities": [
-                        {
-                            "type": "PERSON",
-                            "value": "张三",
-                            "translation_instruction": "translate as 'Zhang San'"
-                        }
-                    ]
-                }
-            ],
-            "translationGuidance": {
-                "persons": ["张三 -> Zhang San"],
-                "locations": ["北京 -> Beijing"],
-                "organizations": ["北京大学 -> Peking University"],
-                "terms": ["机器学习 -> Machine Learning"]
-            }
+            "entities": [...],
+            "translationGuidance": {...}
         }
     """
+    # 记录废弃警告
+    log_message(f"[废弃API] confirm-entities 被调用，建议迁移到原子化API /entity/confirm + /llm/optimize", "WARN")
+
     try:
         current_user_id = get_jwt_identity()
         user = User.query.get(current_user_id)
@@ -8085,6 +8087,10 @@ app.add_url_rule('/api/clients/<client_id>/export', 'export_client_materials',
 # 图片背景文字分离功能
 from routes.image_separation import image_separation_bp
 app.register_blueprint(image_separation_bp)
+
+# 原子化翻译API（解耦重构）
+from routes.atomic_translation import atomic_bp
+app.register_blueprint(atomic_bp)
 
 if __name__ == '__main__':
     # 确保工作目录在脚本所在目录
