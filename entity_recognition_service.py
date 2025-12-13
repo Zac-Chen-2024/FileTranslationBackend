@@ -115,23 +115,123 @@ class EntityRecognitionService:
 
     def _call_fast_query(self, ocr_result: Dict) -> Dict:
         """
-        快速查询模式 - 快速识别实体 + LLM初步翻译英文名
-        对应 Entity API 的 "identify" 模式，但额外用LLM翻译
+        快速查询模式 - 纯LLM实现，不调用外部API
+
+        使用OpenAI识别实体 + 翻译英文名
 
         Args:
             ocr_result: OCR识别结果
 
         Returns:
-            快速识别的实体结果（包含LLM翻译的初步英文名）
+            快速识别的实体结果（包含LLM翻译的英文名）
         """
-        # 第一步：调用identify API识别实体
-        result = self._call_company_query_api(ocr_result, mode="identify")
+        start_time = time.time()
 
-        # 第二步：如果识别成功且有实体，用LLM翻译英文名
-        if result.get('success') and result.get('entities'):
-            result = self._add_llm_translations(result)
+        # 第一步：用LLM识别实体（不调用外部API）
+        entities = self._llm_identify_entities(ocr_result)
+
+        if not entities:
+            return {
+                "success": True,
+                "mode": "identify",
+                "entities": [],
+                "total_entities": 0,
+                "processing_time": time.time() - start_time,
+                "error": None
+            }
+
+        # 构造结果格式
+        result = {
+            "success": True,
+            "mode": "identify",
+            "entities": [{"chinese_name": name, "english_name": None, "type": "ORGANIZATION"} for name in entities],
+            "total_entities": len(entities),
+            "processing_time": 0,
+            "error": None
+        }
+
+        # 第二步：用LLM翻译英文名
+        result = self._add_llm_translations(result)
+        result["processing_time"] = time.time() - start_time
 
         return result
+
+    def _llm_identify_entities(self, ocr_result: Dict) -> List[str]:
+        """
+        使用OpenAI LLM从文本中识别公司/品牌实体
+
+        Args:
+            ocr_result: OCR识别结果
+
+        Returns:
+            识别出的实体名称列表
+        """
+        # 合并所有region的文本
+        regions = ocr_result.get("regions", [])
+        all_text = " ".join([r.get('src', '') for r in regions if r.get('src')])
+
+        if not all_text.strip():
+            return []
+
+        print(f"[实体识别] 使用LLM识别实体，文本长度: {len(all_text)}")
+
+        try:
+            from llm_service import LLMTranslationService
+            llm_service = LLMTranslationService()
+
+            if not llm_service.client:
+                print("[实体识别] LLM服务未配置")
+                return []
+
+            prompt = f"""请从以下文本中识别出公司名称、品牌名称、机构名称等实体。
+
+要求：
+1. 只提取完整的公司/品牌/机构名称
+2. 对于游戏、产品名称（如"王者荣耀"、"微信"），也需要识别
+3. 每行输出一个名称，不要编号或解释
+4. 如果没有识别到任何实体，输出"无"
+
+文本内容：
+{all_text[:2000]}
+
+请直接输出实体名称列表："""
+
+            response = llm_service.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "你是专业的实体识别助手，专门识别文本中的公司、品牌、机构名称。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+
+            response_text = response.choices[0].message.content.strip()
+            print(f"[实体识别] LLM识别响应: {response_text[:200]}...")
+
+            # 解析响应
+            if response_text in ['无', 'None', '没有', '未识别到']:
+                return []
+
+            entities = []
+            for line in response_text.split('\n'):
+                line = line.strip()
+                # 移除序号和常见前缀
+                line = line.lstrip('0123456789.-、:：) ')
+                if line and len(line) >= 2 and line not in ['无', 'None', '没有']:
+                    entities.append(line)
+
+            # 去重
+            entities = list(dict.fromkeys(entities))
+
+            print(f"[实体识别] LLM识别到 {len(entities)} 个实体: {entities}")
+            return entities
+
+        except Exception as e:
+            print(f"[实体识别] LLM识别失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     def _add_llm_translations(self, result: Dict) -> Dict:
         """
@@ -238,39 +338,53 @@ class EntityRecognitionService:
 
     def _call_deep_query(self, ocr_result: Dict) -> Dict:
         """
-        深度查询模式 - 进行完整的Google搜索和官网分析
-        对应 Entity API 的 "analyze" 模式
+        深度查询模式 - 暂时禁用
+
+        注意：此功能需要本地部署LLM + Google Search API，暂未开放。
+        参考实现：/home/translation/reference/entity/entity_app.py
 
         Args:
             ocr_result: OCR识别结果
 
         Returns:
-            深度查询的实体结果，包含准确的官方英文名称
+            占位响应，提示功能暂未开放
         """
-        return self._call_company_query_api(ocr_result, mode="analyze")
+        print("[实体识别] 深度模式暂未开放")
+        return {
+            "success": False,
+            "mode": "analyze",
+            "entities": [],
+            "total_entities": 0,
+            "processing_time": 0,
+            "error": "深度实体检测功能暂未开放，敬请期待",
+            "recoverable": True,
+            "message": "请使用标准模式进行实体识别"
+        }
 
     def _call_manual_adjust(self, ocr_result: Dict) -> Dict:
         """
-        人工调整模式 - 对用户编辑后的实体列表进行深度分析
+        人工调整模式 - 暂时禁用（依赖深度分析功能）
 
-        注意：Entity API 没有单独的 manual_adjust 模式。
-        这个模式实际上是：先用 identify 快速识别，用户编辑后，
-        再用 analyze 模式对选定的实体进行深度分析。
-
-        这里直接使用 analyze 模式进行深度查询。
+        注意：此功能需要本地部署LLM + Google Search API，暂未开放。
+        参考实现：/home/translation/reference/entity/entity_app.py
 
         Args:
             ocr_result: OCR识别结果（可能包含用户编辑的实体列表）
 
         Returns:
-            深度分析后的实体结果
+            占位响应，提示功能暂未开放
         """
-        # 如果 ocr_result 中包含用户编辑的实体列表，使用两阶段查询
-        if 'user_entities' in ocr_result and ocr_result['user_entities']:
-            return self._call_analyze_with_entities(ocr_result['user_entities'])
-        else:
-            # 否则，直接对整个文本进行 analyze
-            return self._call_company_query_api(ocr_result, mode="analyze")
+        print("[实体识别] 人工调整模式（深度分析）暂未开放")
+        return {
+            "success": False,
+            "mode": "analyze",
+            "entities": [],
+            "total_entities": 0,
+            "processing_time": 0,
+            "error": "深度实体检测功能暂未开放，敬请期待",
+            "recoverable": True,
+            "message": "请使用标准模式进行实体识别"
+        }
 
     def _call_analyze_with_entities(self, entities_list: List[str]) -> Dict:
         """
