@@ -121,7 +121,46 @@ class LLMTranslationService:
 
             # 解析结果
             llm_output = response.choices[0].message.content
-            return self._parse_llm_output(llm_output, regions)
+            translations = self._parse_llm_output(llm_output, regions)
+
+            # 🔧 验证输出完整性
+            input_ids = {r.get('id') for r in regions if r.get('src')}
+            output_ids = {t['id'] for t in translations}
+            missing_ids = input_ids - output_ids
+
+            if missing_ids:
+                print(f"⚠️ 警告：{len(missing_ids)} 个翻译缺失: {sorted(missing_ids)}")
+                # 对缺失的翻译使用百度翻译作为fallback
+                for region in regions:
+                    if region.get('id') in missing_ids:
+                        fallback_text = region.get('dst', region.get('src', ''))
+                        translations.append({
+                            'id': region['id'],
+                            'translation': fallback_text,
+                            'original': region.get('dst', '')
+                        })
+                        print(f"  → ID {region['id']} 使用百度翻译作为fallback: {fallback_text[:50]}...")
+
+            # 🔧 验证翻译是否错位（LLM可能把翻译和ID搞混）
+            # 构建百度翻译到region_id的映射
+            baidu_to_id = {r.get('dst', '').strip().lower(): r.get('id') for r in regions if r.get('dst')}
+
+            for t in translations:
+                llm_trans = t.get('translation', '').strip().lower()
+                expected_id = t['id']
+
+                # 检查LLM翻译是否与其他区域的百度翻译完全匹配
+                if llm_trans in baidu_to_id:
+                    actual_id = baidu_to_id[llm_trans]
+                    if actual_id != expected_id:
+                        # LLM返回了错误区域的翻译！使用正确的百度翻译替代
+                        correct_region = next((r for r in regions if r.get('id') == expected_id), None)
+                        if correct_region and correct_region.get('dst'):
+                            print(f"⚠️ 检测到翻译错位: ID {expected_id} 的LLM翻译实际上是ID {actual_id}的百度翻译")
+                            print(f"  → 使用正确的百度翻译替代: {correct_region['dst'][:50]}...")
+                            t['translation'] = correct_region['dst']
+
+            return translations
 
         except Exception as e:
             raise Exception(f"LLM翻译调用失败: {str(e)}")
@@ -213,6 +252,9 @@ OUTPUT INSTRUCTIONS: Provide exactly {count} translated lines, each starting wit
                     'translation': translation,
                     'original': original
                 })
+
+        # 🔧 按ID排序确保顺序正确
+        translations.sort(key=lambda t: t['id'])
 
         return translations
 

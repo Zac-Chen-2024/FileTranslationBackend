@@ -115,16 +115,126 @@ class EntityRecognitionService:
 
     def _call_fast_query(self, ocr_result: Dict) -> Dict:
         """
-        快速查询模式 - 快速识别实体但不进行深度搜索
-        对应 Entity API 的 "identify" 模式
+        快速查询模式 - 快速识别实体 + LLM初步翻译英文名
+        对应 Entity API 的 "identify" 模式，但额外用LLM翻译
 
         Args:
             ocr_result: OCR识别结果
 
         Returns:
-            快速识别的实体结果
+            快速识别的实体结果（包含LLM翻译的初步英文名）
         """
-        return self._call_company_query_api(ocr_result, mode="identify")
+        # 第一步：调用identify API识别实体
+        result = self._call_company_query_api(ocr_result, mode="identify")
+
+        # 第二步：如果识别成功且有实体，用LLM翻译英文名
+        if result.get('success') and result.get('entities'):
+            result = self._add_llm_translations(result)
+
+        return result
+
+    def _add_llm_translations(self, result: Dict) -> Dict:
+        """
+        用LLM为识别出的实体添加初步英文翻译
+
+        Args:
+            result: identify模式的识别结果
+
+        Returns:
+            添加了英文翻译的结果
+        """
+        entities = result.get('entities', [])
+        if not entities:
+            return result
+
+        # 提取所有中文实体名
+        chinese_names = [e.get('chinese_name', '') for e in entities if e.get('chinese_name')]
+
+        if not chinese_names:
+            return result
+
+        print(f"[实体识别] 使用LLM翻译 {len(chinese_names)} 个实体名称...")
+
+        try:
+            # 导入LLM服务
+            from llm_service import LLMTranslationService
+            llm_service = LLMTranslationService()
+
+            if not llm_service.client:
+                print("[实体识别] LLM服务未配置，跳过英文翻译")
+                return result
+
+            # 构建翻译prompt
+            prompt = f"""请将以下中文公司/组织/品牌名称翻译为英文。
+如果是知名公司，请使用其官方英文名称。
+如果不确定，请提供合理的英文翻译。
+
+请严格按照JSON格式返回，每个名称一行：
+{{"中文名": "英文名"}}
+
+中文名称列表：
+{chr(10).join(chinese_names)}
+
+请直接返回JSON对象，不要有其他文字："""
+
+            # 调用LLM
+            response = llm_service.client.chat.completions.create(
+                model="gpt-4o-mini",  # 使用快速模型
+                messages=[
+                    {"role": "system", "content": "你是一个专业的翻译助手，专门翻译公司和组织名称。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1000
+            )
+
+            # 解析响应
+            response_text = response.choices[0].message.content.strip()
+            print(f"[实体识别] LLM翻译响应: {response_text[:200]}...")
+
+            # 尝试解析JSON
+            try:
+                # 清理可能的markdown代码块
+                if response_text.startswith('```'):
+                    response_text = response_text.split('```')[1]
+                    if response_text.startswith('json'):
+                        response_text = response_text[4:]
+                response_text = response_text.strip()
+
+                translations = json.loads(response_text)
+
+                # 更新实体的英文名（标准模式不显示证据来源）
+                for entity in entities:
+                    chinese_name = entity.get('chinese_name', '')
+                    if chinese_name in translations:
+                        entity['english_name'] = translations[chinese_name]
+                        # 标准模式不设置source，留空让用户可以直接使用或选择深度搜索
+
+                print(f"[实体识别] LLM翻译完成，已更新 {len(translations)} 个实体的英文名")
+
+            except json.JSONDecodeError as e:
+                print(f"[实体识别] LLM响应解析失败: {e}")
+                # 尝试逐行解析
+                for line in response_text.split('\n'):
+                    line = line.strip()
+                    if ':' in line or '：' in line:
+                        parts = line.replace('：', ':').split(':')
+                        if len(parts) >= 2:
+                            cn = parts[0].strip().strip('"\'{}')
+                            en = parts[1].strip().strip('"\'{}，,')
+                            for entity in entities:
+                                if entity.get('chinese_name') == cn:
+                                    entity['english_name'] = en
+                                    # 标准模式不设置source
+
+        except Exception as e:
+            print(f"[实体识别] LLM翻译失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 翻译失败不影响整体流程，返回原结果
+
+        result['entities'] = entities
+        return result
 
     def _call_deep_query(self, ocr_result: Dict) -> Dict:
         """

@@ -34,31 +34,44 @@ from functools import wraps
 from threading import Lock
 from enum import Enum
 
-# ========== 状态枚举定义 ==========
+# ========== 状态机导入 ==========
+# 完整的状态机定义在 state_machine.py 中
+from state_machine import (
+    ProcessingStep,
+    StateMachine,
+    StateTransitionError,
+    STATUS_DISPLAY,
+    STATUS_COLORS,
+    PROCESSING_STATES,
+    PENDING_ACTION_STATES,
+    COMPLETED_STATES,
+    SKIPPABLE_STATES,
+    WORKFLOW_PATHS,
+    get_status_display,
+    get_legacy_status,
+    is_processing,
+    is_pending_action,
+    is_completed,
+    is_failed,
+)
+
+
+# ========== 废弃的枚举（保留用于向后兼容）==========
 
 class MaterialStatus(str, Enum):
-    """材料状态枚举 - 统一管理所有状态值"""
-    PENDING = '待处理'          # 初始状态（未使用）
-    UPLOADED = '已上传'         # 文件已上传，等待翻译
-    SPLITTING = '拆分中'        # PDF拆分进行中
-    TRANSLATING = '翻译中'      # 翻译进行中
-    TRANSLATED = '翻译完成'     # 翻译完成
-    FAILED = '翻译失败'         # 翻译失败
-    CONFIRMED = '已确认'        # 用户确认
+    """
+    [已废弃] 材料状态枚举
 
-class ProcessingStep(str, Enum):
-    """处理步骤枚举"""
-    UPLOADED = 'uploaded'            # 已上传
-    SPLITTING = 'splitting'          # 拆分中
-    SPLIT_COMPLETED = 'split_completed'  # 拆分完成
-    TRANSLATING = 'translating'      # 翻译中（OCR翻译）
-    TRANSLATED = 'translated'        # 翻译完成（OCR翻译完成）
-    ENTITY_RECOGNIZING = 'entity_recognizing'  # 实体识别中
-    ENTITY_PENDING_CONFIRM = 'entity_pending_confirm'  # 等待实体确认
-    ENTITY_CONFIRMED = 'entity_confirmed'  # 实体已确认
-    LLM_TRANSLATING = 'llm_translating'  # LLM翻译中
-    LLM_TRANSLATED = 'llm_translated'  # LLM翻译完成
-    FAILED = 'failed'                # 失败
+    请使用 ProcessingStep 枚举代替。
+    此枚举仅保留用于向后兼容，将在未来版本中移除。
+    """
+    PENDING = '待处理'
+    UPLOADED = '已上传'
+    SPLITTING = '拆分中'
+    TRANSLATING = '翻译中'
+    TRANSLATED = '翻译完成'
+    FAILED = '翻译失败'
+    CONFIRMED = '已确认'
 
 # 百度翻译API配置会在translate_filename函数中动态加载
 
@@ -3626,13 +3639,13 @@ def upload_files(client_id):
                                 type='image',
                                 original_filename=f"{file.filename}_page_{page_num + 1}",
                                 file_path=file_path,  # 暂时指向原PDF
-                                status='拆分中',  # 统一状态值
+                                status=get_legacy_status(ProcessingStep.SPLITTING.value),
                                 client_id=client_id,
                                 pdf_session_id=pdf_session_id,
                                 pdf_page_number=page_num + 1,
                                 pdf_total_pages=total_pages,
                                 pdf_original_file=file_path,
-                                processing_step='splitting',
+                                processing_step=ProcessingStep.SPLITTING.value,
                                 processing_progress=0  # 0%开始
                             )
                             db.session.add(page_material)
@@ -3765,8 +3778,8 @@ def upload_files(client_id):
                                             # 存储相对路径（相对于项目根目录）
                                             relative_path = os.path.relpath(img_path, app.root_path)
                                             page_material.file_path = relative_path
-                                            page_material.status = '已上传'  # 统一状态：拆分完成后等待翻译
-                                            page_material.processing_step = 'split_completed'
+                                            page_material.status = get_legacy_status(ProcessingStep.SPLIT_COMPLETED.value)
+                                            page_material.processing_step = ProcessingStep.SPLIT_COMPLETED.value
                                             page_material.processing_progress = 100  # 拆分完成
                                             db.session.commit()
 
@@ -3807,7 +3820,8 @@ def upload_files(client_id):
                             type=file_type,
                             original_filename=file.filename,
                             file_path=file_path,
-                            status='已上传',
+                            status=get_legacy_status(ProcessingStep.UPLOADED.value),
+                            processing_step=ProcessingStep.UPLOADED.value,
                             client_id=client_id
                         )
                         db.session.add(material)
@@ -3897,10 +3911,10 @@ def upload_files(client_id):
                         type=file_type,
                         original_filename=file.filename,
                         file_path=file_path,
-                        status='已上传',  # ✅ 改为'已上传'，等待用户手动开始翻译
+                        status=get_legacy_status(ProcessingStep.UPLOADED.value),
                         client_id=client_id,
-                        processing_step='uploaded',
-                        processing_progress=0  # ✅ 改为0，表示未开始
+                        processing_step=ProcessingStep.UPLOADED.value,
+                        processing_progress=0
                     )
                     db.session.add(material)
                     uploaded_materials.append(material)
@@ -3961,7 +3975,8 @@ def upload_urls(client_id):
                     name=title,  # 使用网页标题
                     type='webpage',
                     url=url.strip(),
-                    status='已添加',
+                    status=get_legacy_status(ProcessingStep.UPLOADED.value),
+                    processing_step=ProcessingStep.UPLOADED.value,
                     client_id=client_id
                 )
                 db.session.add(material)
@@ -4593,8 +4608,9 @@ def retry_latex_translation(material_id):
                     material.latex_translation_error = None
                     
                     # 如果之前完全失败，现在更新状态为翻译完成
-                    if material.status == '翻译失败':
-                        material.status = '翻译完成'
+                    if material.status in ['翻译失败', get_legacy_status(ProcessingStep.FAILED.value)]:
+                        material.status = get_legacy_status(ProcessingStep.TRANSLATED.value)
+                        material.processing_step = ProcessingStep.TRANSLATED.value
                     
                     db.session.commit()
                     
@@ -5086,7 +5102,8 @@ def confirm_material(material_id):
             confirmed_count = 0
             for page in pdf_pages:
                 page.confirmed = True
-                page.status = '已确认'
+                page.status = get_legacy_status(ProcessingStep.CONFIRMED.value)
+                page.processing_step = ProcessingStep.CONFIRMED.value
                 page.updated_at = datetime.utcnow()
                 confirmed_count += 1
 
@@ -5094,7 +5111,8 @@ def confirm_material(material_id):
         else:
             # 非PDF材料，只确认当前材料
             material.confirmed = True
-            material.status = '已确认'
+            material.status = get_legacy_status(ProcessingStep.CONFIRMED.value)
+            material.processing_step = ProcessingStep.CONFIRMED.value
 
             # 如果指定了翻译类型，设置选择的翻译类型（仅限图片材料）
             if translation_type and translation_type in ['api', 'latex'] and material.type == 'image':
@@ -5261,7 +5279,8 @@ def unconfirm_material(material_id):
             unconfirmed_count = 0
             for page in pdf_pages:
                 page.confirmed = False
-                page.status = '翻译完成'
+                page.status = get_legacy_status(ProcessingStep.TRANSLATED.value)
+                page.processing_step = ProcessingStep.TRANSLATED.value
                 page.updated_at = datetime.utcnow()
                 unconfirmed_count += 1
 
@@ -5269,7 +5288,8 @@ def unconfirm_material(material_id):
         else:
             # 非PDF材料，只取消确认当前材料
             material.confirmed = False
-            material.status = '翻译完成'
+            material.status = get_legacy_status(ProcessingStep.TRANSLATED.value)
+            material.processing_step = ProcessingStep.TRANSLATED.value
             material.updated_at = datetime.utcnow()
             log_message(f"取消确认材料: {material_id}", "SUCCESS")
 
@@ -7135,10 +7155,28 @@ def llm_translate_material(material_id):
 @app.route('/api/materials/<material_id>/retranslate', methods=['POST'])
 @jwt_required()
 def retranslate_material(material_id):
-    """重新翻译单个材料（百度翻译 + LLM优化）"""
+    """
+    重新翻译单个材料
+
+    支持两种模式：
+    1. 完整重新翻译：百度翻译 → 实体识别(可选) → LLM优化
+    2. 保留实体结果：百度翻译 → 使用之前的实体结果 → LLM优化
+
+    请求参数：
+    - preserveEntityData: bool, 是否保留之前的实体识别结果（默认false）
+    - skipLLM: bool, 是否跳过LLM优化，只做百度翻译（默认false，用于需要先做实体识别的情况）
+    """
     try:
         log_message(f"========== 开始重新翻译材料 ==========", "INFO")
         log_message(f"材料ID: {material_id}", "INFO")
+
+        # 获取请求参数
+        data = request.get_json() or {}
+        log_message(f"收到请求数据: {data}", "INFO")
+        preserve_entity_data = data.get('preserveEntityData', False)
+        skip_llm = data.get('skipLLM', False)
+
+        log_message(f"解析参数: preserveEntityData={preserve_entity_data}, skipLLM={skip_llm}", "INFO")
 
         # ✅ 检查翻译锁，防止重复翻译
         is_locked, locked_material = check_translation_lock(material_id)
@@ -7167,6 +7205,18 @@ def retranslate_material(material_id):
 
         log_message(f"材料名称: {material.name}, 类型: {material.type}", "INFO")
 
+        # 保存之前的实体数据（如果需要保留）
+        previous_entity_data = None
+        if preserve_entity_data:
+            previous_entity_data = {
+                'entity_recognition_enabled': material.entity_recognition_enabled,
+                'entity_recognition_mode': material.entity_recognition_mode,
+                'entity_recognition_result': material.entity_recognition_result,
+                'entity_user_edits': material.entity_user_edits,
+                'entity_recognition_confirmed': material.entity_recognition_confirmed,
+            }
+            log_message(f"保留之前的实体数据: enabled={previous_entity_data['entity_recognition_enabled']}", "INFO")
+
         # 调用Reference方式的百度翻译（函数在app.py内部定义）
         result = translate_image_reference(
             image_path=material.file_path,
@@ -7188,8 +7238,8 @@ def retranslate_material(material_id):
             return jsonify({'success': False, 'error': error_msg}), 500
 
         # 解析regions数据
-        data = result.get('data', {})
-        content = data.get('content', [])
+        api_data = result.get('data', {})
+        content = api_data.get('content', [])
 
         if not content:
             log_message(f"百度翻译未识别到文字: {material.name}", "WARN")
@@ -7207,9 +7257,65 @@ def retranslate_material(material_id):
         material.has_edited_version = False
         material.edited_regions = None
 
-        # 保存新的百度翻译结果（覆盖旧的）
+        # 清除或恢复实体数据
+        if preserve_entity_data and previous_entity_data:
+            # 恢复之前的实体数据
+            material.entity_recognition_enabled = previous_entity_data['entity_recognition_enabled']
+            material.entity_recognition_mode = previous_entity_data['entity_recognition_mode']
+            material.entity_recognition_result = previous_entity_data['entity_recognition_result']
+            material.entity_user_edits = previous_entity_data['entity_user_edits']
+            material.entity_recognition_confirmed = previous_entity_data['entity_recognition_confirmed']
+            log_message(f"已恢复之前的实体数据", "INFO")
+        else:
+            # 清除实体数据
+            material.entity_recognition_enabled = False
+            material.entity_recognition_mode = None
+            material.entity_recognition_result = None
+            material.entity_user_edits = None
+            material.entity_recognition_confirmed = False
+            material.entity_recognition_error = None
+            log_message(f"已清除实体数据", "INFO")
+
+        # 保存新的百度翻译结果
         regions_data = {'regions': content}
-        # ✅ 使用统一函数更新状态
+
+        # 如果跳过LLM，只保存百度翻译结果，等待实体识别
+        if skip_llm:
+            update_material_status(
+                material,
+                MaterialStatus.TRANSLATED,
+                translation_text_info=regions_data,
+                translation_error=None,
+                llm_translation_result=None,  # 清除旧的LLM结果
+                processing_step=ProcessingStep.TRANSLATED.value,
+                processing_progress=66
+            )
+
+            log_message(f"百度翻译完成（跳过LLM）: {material.name}, 识别了 {len(content)} 个区域", "SUCCESS")
+
+            return jsonify({
+                'success': True,
+                'material': {
+                    'id': material.id,
+                    'name': material.name,
+                    'status': material.status,
+                    'filePath': material.file_path,
+                    'translationTextInfo': regions_data,
+                    'llmTranslationResult': None,
+                    'processingProgress': 66,
+                    'processingStep': ProcessingStep.TRANSLATED.value,
+                    'entityRecognitionEnabled': material.entity_recognition_enabled,
+                    'entityRecognitionResult': material.entity_recognition_result,
+                    'entityUserEdits': material.entity_user_edits,
+                    'pdfSessionId': material.pdf_session_id,
+                    'pdfPageNumber': material.pdf_page_number,
+                    'pdfTotalPages': material.pdf_total_pages
+                },
+                'message': '百度翻译完成，等待实体识别',
+                'needEntityRecognition': True  # 提示前端需要触发实体识别流程
+            })
+
+        # 正常流程：百度翻译 + LLM优化
         update_material_status(
             material,
             MaterialStatus.TRANSLATED,
@@ -7221,21 +7327,32 @@ def retranslate_material(material_id):
 
         log_message(f"百度翻译成功: {material.name}, 识别了 {len(content)} 个区域", "SUCCESS")
 
-        # 自动触发LLM优化（覆盖旧的）
+        # 自动触发LLM优化
         log_message(f"开始LLM优化翻译...", "INFO")
         from llm_service import LLMTranslationService
         llm_service = LLMTranslationService(output_folder='outputs')
 
-        llm_translations = llm_service.optimize_translations(content)
+        # 如果有保留的实体数据，使用它来指导LLM翻译
+        entity_guidance = None
+        if preserve_entity_data and previous_entity_data and previous_entity_data.get('entity_user_edits'):
+            try:
+                entity_edits = previous_entity_data['entity_user_edits']
+                if isinstance(entity_edits, str):
+                    entity_edits = json.loads(entity_edits)
+                entity_guidance = entity_edits.get('translationGuidance')
+                log_message(f"使用保留的实体指导进行LLM翻译", "INFO")
+            except Exception as e:
+                log_message(f"解析实体指导数据失败: {e}", "WARN")
+
+        llm_translations = llm_service.optimize_translations(content, entity_guidance=entity_guidance)
         log_message(f"LLM优化完成，返回 {len(llm_translations)} 个翻译结果", "SUCCESS")
 
-        # 保存LLM翻译结果（覆盖旧的）
-        # ✅ 使用统一函数更新状态
+        # 保存LLM翻译结果
         update_material_status(
             material,
             MaterialStatus.TRANSLATED,
             llm_translation_result=json.dumps(llm_translations, ensure_ascii=False),
-            processing_step=ProcessingStep.TRANSLATED.value,
+            processing_step=ProcessingStep.LLM_TRANSLATED.value,
             processing_progress=100
         )
 
@@ -7251,8 +7368,8 @@ def retranslate_material(material_id):
                 'translationTextInfo': regions_data,
                 'llmTranslationResult': llm_translations,
                 'processingProgress': 100,
-                'processingStep': 'completed',
-                # 保留PDF相关字段，避免前端更新时丢失
+                'processingStep': ProcessingStep.LLM_TRANSLATED.value,
+                'entityRecognitionEnabled': material.entity_recognition_enabled,
                 'pdfSessionId': material.pdf_session_id,
                 'pdfPageNumber': material.pdf_page_number,
                 'pdfTotalPages': material.pdf_total_pages
@@ -7324,8 +7441,8 @@ def rotate_material(material_id):
         material.final_image_path = None
         material.has_edited_version = False
         material.edited_regions = None
-        material.status = '已上传'  # 重置状态为已上传
-        material.processing_step = None
+        material.status = get_legacy_status(ProcessingStep.UPLOADED.value)
+        material.processing_step = ProcessingStep.UPLOADED.value
         material.processing_progress = 0
         material.updated_at = datetime.utcnow()
 
